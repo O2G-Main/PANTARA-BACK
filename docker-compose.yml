@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: pantara-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pantara}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pantara_dev_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-pantara_db}
+    ports:
+      - "${PG_HOST_PORT:-55432}:5432"
+    volumes:
+      - pantara_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pantara} -d ${POSTGRES_DB:-pantara_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: pantara-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "${REDIS_HOST_PORT:-16379}:6379"
+    volumes:
+      - pantara_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pantara_pgdata:
+  pantara_redisdata:
