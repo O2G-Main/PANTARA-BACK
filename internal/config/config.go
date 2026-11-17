@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+const DefaultDevJWTSecret = "pantara-dev-jwt-secret-change-in-production-32bytes-min"
+
 // Config holds runtime configuration for the Pantara API server, migrate, and seed binaries.
 type Config struct {
 	AppEnv             string
@@ -20,9 +22,10 @@ type Config struct {
 
 	RedisURL string
 
-	JWTSecret    string
-	CookieSecure bool
-	CookieDomain string
+	JWTSecret        string
+	CookieSecure     bool
+	CookieSecureAuto bool
+	CookieDomain     string
 
 	AIProviderURL string
 	AIAPIKey      string
@@ -50,6 +53,8 @@ func Load() Config {
 		}
 	}
 
+	cookieMode := strings.ToLower(envOr("COOKIE_SECURE", "false"))
+
 	return Config{
 		AppEnv:             envOr("APP_ENV", "development"),
 		Port:               envOr("PORT", "8000"),
@@ -61,9 +66,10 @@ func Load() Config {
 
 		RedisURL: strings.TrimSpace(os.Getenv("REDIS_URL")),
 
-		JWTSecret:    envOr("JWT_SECRET", "pantara-dev-jwt-secret-change-in-production-32bytes-min"),
-		CookieSecure: envBool("COOKIE_SECURE", false),
-		CookieDomain: strings.TrimSpace(os.Getenv("COOKIE_DOMAIN")),
+		JWTSecret:        envOr("JWT_SECRET", DefaultDevJWTSecret),
+		CookieSecure:     cookieMode == "true" || cookieMode == "1" || cookieMode == "yes",
+		CookieSecureAuto: cookieMode == "auto",
+		CookieDomain:     strings.TrimSpace(os.Getenv("COOKIE_DOMAIN")),
 
 		AIProviderURL: strings.TrimSpace(os.Getenv("AI_PROVIDER_URL")),
 		AIAPIKey:      strings.TrimSpace(os.Getenv("AI_API_KEY")),
@@ -140,16 +146,4 @@ func envInt(key string, fallback int) int {
 		return fallback
 	}
 	return n
-}
-
-func envBool(key string, fallback bool) bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
-	switch v {
-	case "true", "1", "yes":
-		return true
-	case "false", "0", "no":
-		return false
-	default:
-		return fallback
-	}
 }

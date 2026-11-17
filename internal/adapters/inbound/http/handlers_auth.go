@@ -29,7 +29,7 @@ func (h *authHandlers) register(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
-	setAuthCookies(w, h.cookies, tok)
+	setAuthCookies(w, r, h.cookies, tok)
 	writeCreated(w, AuthResponse{
 		User:        toUserView(tok.User),
 		AccessToken: tok.AccessToken,
@@ -52,7 +52,7 @@ func (h *authHandlers) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
-	setAuthCookies(w, h.cookies, tok)
+	setAuthCookies(w, r, h.cookies, tok)
 	writeOK(w, AuthResponse{
 		User:        toUserView(tok.User),
 		AccessToken: tok.AccessToken,
@@ -75,11 +75,11 @@ func (h *authHandlers) refresh(w http.ResponseWriter, r *http.Request) {
 	}
 	tok, err := h.uc.Refresh(r.Context(), rawRefresh, r.UserAgent())
 	if err != nil {
-		clearAuthCookies(w, h.cookies)
+		clearAuthCookies(w, r, h.cookies)
 		writeError(w, r, err)
 		return
 	}
-	setAuthCookies(w, h.cookies, tok)
+	setAuthCookies(w, r, h.cookies, tok)
 	writeOK(w, AuthResponse{
 		User:        toUserView(tok.User),
 		AccessToken: tok.AccessToken,
@@ -91,7 +91,7 @@ func (h *authHandlers) logout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(RefreshCookieName); err == nil && c.Value != "" {
 		_ = h.uc.Logout(r.Context(), c.Value)
 	}
-	clearAuthCookies(w, h.cookies)
+	clearAuthCookies(w, r, h.cookies)
 	writeOK(w, map[string]bool{"ok": true})
 }
 
@@ -101,7 +101,7 @@ func (h *authHandlers) logoutAll(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
-	clearAuthCookies(w, h.cookies)
+	clearAuthCookies(w, r, h.cookies)
 	writeOK(w, map[string]bool{"ok": true})
 }
 
@@ -133,7 +133,7 @@ func (h *authHandlers) resetPassword(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
-	clearAuthCookies(w, h.cookies)
+	clearAuthCookies(w, r, h.cookies)
 	writeOK(w, map[string]bool{"ok": true})
 }
 
@@ -170,7 +170,7 @@ func (h *authHandlers) acceptInvite(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
-	setAuthCookies(w, h.cookies, tok)
+	setAuthCookies(w, r, h.cookies, tok)
 	writeOK(w, AuthResponse{
 		User:        toUserView(tok.User),
 		AccessToken: tok.AccessToken,

@@ -85,6 +85,7 @@ func NewContainer(cfg config.Config, store *sqlstore.Store, clock port.Clock, lo
 		HealthCheck:        store.Ping,
 		CORSAllowedOrigins: cfg.CORSAllowedOrigins,
 		CookieSecure:       cfg.CookieSecure,
+		CookieSecureAuto:   cfg.CookieSecureAuto,
 		CookieDomain:       cfg.CookieDomain,
 		IncludeDevTokens:   cfg.AppEnv != "production",
 		Logger:             log,

@@ -25,6 +25,7 @@ type RouterDeps struct {
 	HealthCheck        func(ctx context.Context) error
 	CORSAllowedOrigins []string
 	CookieSecure       bool
+	CookieSecureAuto   bool
 	CookieDomain       string
 	IncludeDevTokens   bool
 	Logger             *slog.Logger
@@ -64,7 +65,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 		writeOK(w, map[string]string{"status": "ready"})
 	})
 
-	cookies := cookieConfig{Secure: deps.CookieSecure, Domain: deps.CookieDomain}
+	cookies := cookieConfig{Secure: deps.CookieSecure, Auto: deps.CookieSecureAuto, Domain: deps.CookieDomain}
 	ah := &authHandlers{uc: deps.AuthUC, cookies: cookies}
 	wh := &workspaceHandlers{uc: deps.WorkspaceUC}
 	ch := &catalogHandlers{uc: deps.CatalogUC, includeDevTokens: deps.IncludeDevTokens}

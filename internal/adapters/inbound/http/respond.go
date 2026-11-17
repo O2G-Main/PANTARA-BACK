@@ -150,15 +150,32 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 
 type cookieConfig struct {
 	Secure bool
+	Auto   bool
 	Domain string
 }
 
-func setAuthCookies(w http.ResponseWriter, cfg cookieConfig, tokens usecase.AuthTokens) {
+func isSecureCookie(r *http.Request, cfg cookieConfig) bool {
+	if cfg.Secure {
+		return true
+	}
+	if cfg.Auto && r != nil {
+		if r.TLS != nil {
+			return true
+		}
+		if proto := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); strings.EqualFold(proto, "https") {
+			return true
+		}
+	}
+	return false
+}
+
+func setAuthCookies(w http.ResponseWriter, r *http.Request, cfg cookieConfig, tokens usecase.AuthTokens) {
 	accessMaxAge := int(usecase.AccessTokenTTL.Seconds())
 	refreshMaxAge := int(usecase.RefreshShortTTL.Seconds())
 	if tokens.RememberMe {
 		refreshMaxAge = int(usecase.RefreshRememberTTL.Seconds())
 	}
+	secure := isSecureCookie(r, cfg)
 
 	http.SetCookie(w, &http.Cookie{
 		Name:     AccessCookieName,
@@ -168,7 +185,7 @@ func setAuthCookies(w http.ResponseWriter, cfg cookieConfig, tokens usecase.Auth
 		MaxAge:   accessMaxAge,
 		Expires:  time.Now().UTC().Add(usecase.AccessTokenTTL),
 		HttpOnly: true,
-		Secure:   cfg.Secure,
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 	})
 	http.SetCookie(w, &http.Cookie{
@@ -179,12 +196,13 @@ func setAuthCookies(w http.ResponseWriter, cfg cookieConfig, tokens usecase.Auth
 		MaxAge:   refreshMaxAge,
 		Expires:  time.Now().UTC().Add(time.Duration(refreshMaxAge) * time.Second),
 		HttpOnly: true,
-		Secure:   cfg.Secure,
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 	})
 }
 
-func clearAuthCookies(w http.ResponseWriter, cfg cookieConfig) {
+func clearAuthCookies(w http.ResponseWriter, r *http.Request, cfg cookieConfig) {
+	secure := isSecureCookie(r, cfg)
 	http.SetCookie(w, &http.Cookie{
 		Name:     AccessCookieName,
 		Value:    "",
@@ -193,7 +211,7 @@ func clearAuthCookies(w http.ResponseWriter, cfg cookieConfig) {
 		MaxAge:   -1,
 		Expires:  time.Unix(0, 0),
 		HttpOnly: true,
-		Secure:   cfg.Secure,
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 	})
 	http.SetCookie(w, &http.Cookie{
@@ -204,7 +222,7 @@ func clearAuthCookies(w http.ResponseWriter, cfg cookieConfig) {
 		MaxAge:   -1,
 		Expires:  time.Unix(0, 0),
 		HttpOnly: true,
-		Secure:   cfg.Secure,
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 	})
 }

@@ -134,6 +134,7 @@ func (h *analyticsHandlers) streamNotifications(w http.ResponseWriter, r *http.R
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
+	lastPayload := ""
 	sendSnapshot := func() {
 		notices, err := h.uc.ListNotifications(r.Context(), claims)
 		if err != nil {
@@ -143,7 +144,12 @@ func (h *analyticsHandlers) streamNotifications(w http.ResponseWriter, r *http.R
 		if err != nil {
 			return
 		}
-		_, _ = fmt.Fprintf(w, "event: notifications\ndata: %s\n\n", b)
+		payload := string(b)
+		if payload == lastPayload {
+			return
+		}
+		lastPayload = payload
+		_, _ = fmt.Fprintf(w, "event: notifications\ndata: %s\n\n", payload)
 		flusher.Flush()
 	}
 

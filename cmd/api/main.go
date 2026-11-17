@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Orang2-BU/pantara-back/internal/adapters/outbound/security"
+	"github.com/Orang2-BU/pantara-back/internal/adapters/outbound/sqlstore"
 	"github.com/Orang2-BU/pantara-back/internal/app"
 	"github.com/Orang2-BU/pantara-back/internal/config"
 )
@@ -19,11 +20,25 @@ func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	cfg := config.Load()
 
-	rootCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	store, err := app.OpenStore(rootCtx, cfg)
-	cancel()
-	if err != nil {
-		log.Error("database_connect_failed", "err", err)
+	if cfg.AppEnv == "production" && (cfg.JWTSecret == config.DefaultDevJWTSecret || len(cfg.JWTSecret) < 32) {
+		log.Error("invalid_production_jwt_secret", "hint", "Set strong random JWT_SECRET (minimum 32 chars) when APP_ENV=production")
+		os.Exit(1)
+	}
+
+	var store *sqlstore.Store
+	var openErr error
+	for attempt := 1; attempt <= 10; attempt++ {
+		rootCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		store, openErr = app.OpenStore(rootCtx, cfg)
+		cancel()
+		if openErr == nil {
+			break
+		}
+		log.Warn("database_connect_retry", "attempt", attempt, "err", openErr)
+		time.Sleep(2 * time.Second)
+	}
+	if openErr != nil {
+		log.Error("database_connect_failed", "err", openErr)
 		os.Exit(1)
 	}
 
@@ -42,7 +57,7 @@ func main() {
 		}
 	}()
 
-	if cfg.AppEnv != "production" {
+	if cfg.AppEnv != "production" && os.Getenv("SEED_DEMO") == "true" {
 		seedCtx, seedCancel := context.WithTimeout(context.Background(), 20*time.Second)
 		seeded, err := container.SeedIfEmpty(seedCtx, false)
 		seedCancel()

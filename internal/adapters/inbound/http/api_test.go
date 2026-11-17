@@ -608,3 +608,59 @@ func TestConcurrency1000Users(t *testing.T) {
 		t.Fatalf("contested assign race check failed: win200=%d conflict409=%d other=%d samples=%v", win200.Load(), conflict409.Load(), errOther.Load(), errSamples)
 	}
 }
+
+func TestCookieSecureAutoProxyHeader(t *testing.T) {
+	store, err := sqlstore.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite memory: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+	if err := store.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate sqlite: %v", err)
+	}
+	cfg := config.Config{
+		AppEnv:             "production",
+		CORSAllowedOrigins: []string{"https://pantara.example.com"},
+		JWTSecret:          "pantara-unit-test-secret-32-bytes-minimum-key",
+		CookieSecureAuto:   true,
+		AppBaseURL:         "https://pantara.example.com",
+		AIModel:            "gpt-4o-mini",
+	}
+	c := app.NewContainer(cfg, store, security.RealClock{}, nil)
+	if _, err := c.SeedIfEmpty(context.Background(), true); err != nil {
+		t.Fatalf("seed arunika: %v", err)
+	}
+
+	loginPayload := `{"email":"krisna@pantara.id","password":"` + seeddata.DemoPassword + `"}`
+
+	reqPlain := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(loginPayload))
+	reqPlain.Header.Set("Content-Type", "application/json")
+	recPlain := httptest.NewRecorder()
+	c.Handler.ServeHTTP(recPlain, reqPlain)
+	if recPlain.Code != http.StatusOK {
+		t.Fatalf("expected 200 login on plain http, got %d body=%s", recPlain.Code, recPlain.Body.String())
+	}
+	for _, ck := range recPlain.Result().Cookies() {
+		if ck.Secure {
+			t.Fatalf("expected non-secure cookie over plain http, got secure for %s", ck.Name)
+		}
+	}
+
+	reqHTTPS := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(loginPayload))
+	reqHTTPS.Header.Set("Content-Type", "application/json")
+	reqHTTPS.Header.Set("X-Forwarded-Proto", "https")
+	recHTTPS := httptest.NewRecorder()
+	c.Handler.ServeHTTP(recHTTPS, reqHTTPS)
+	if recHTTPS.Code != http.StatusOK {
+		t.Fatalf("expected 200 login on proxied https, got %d body=%s", recHTTPS.Code, recHTTPS.Body.String())
+	}
+	cookiesHTTPS := recHTTPS.Result().Cookies()
+	if len(cookiesHTTPS) < 2 {
+		t.Fatalf("expected access + refresh cookies, got %d", len(cookiesHTTPS))
+	}
+	for _, ck := range cookiesHTTPS {
+		if !ck.Secure {
+			t.Fatalf("expected secure cookie behind X-Forwarded-Proto: https for %s", ck.Name)
+		}
+	}
+}
