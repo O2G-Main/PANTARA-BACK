@@ -12,7 +12,7 @@
 ## 2. Database & Redis (Dokploy Services / Same Network)
 1. Buat service **PostgreSQL 16** dan **Redis 7** di project Dokploy yang sama.
 2. Backend otomatis menjalankan migrasi SQL (`001_init.sql` dan `002_corporate_first.sql` — aman dan idempotent) saat container start (`store.Migrate`), dengan retry koneksi saat cold-start.
-3. Untuk **production bersih**, set `SEED_DEMO=false` (admin pertama daftar dari halaman `/daftar` di frontend). Untuk **pilot / demo** agar dataset Arunika Digital + akun `admin`, `manajer`, `hr@pantara.id`, dan `bima@pantara.id` langsung terisi saat DB kosong, set `SEED_DEMO=true` atau jalankan `/app/pantara-seed` satu kali di container.
+3. Jika database Dokploy sebelumnya sudah memakai dataset demo `org-arunika`, backend otomatis menjalankan backfill idempotent (`UpgradeArunikaIfPresent`) saat start untuk menambah akun `hr@pantara.id`, status freelancer `hana`/`wulan`, `CUTI-fikri-1`, `TGS-0164.extraTime`, tugas eksternal `TGS-0174`, serta `completedAt`/`qualityScore` tanpa menimpa atau mereset data lain. Untuk **fresh database demo**, set `SEED_DEMO=true`; untuk **production bersih**, set `SEED_DEMO=false`.
 
 ## 3. Environment Variables (Dokploy)
 ```env

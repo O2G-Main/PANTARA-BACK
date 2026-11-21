@@ -111,7 +111,8 @@ func NewContainer(cfg config.Config, store *sqlstore.Store, clock port.Clock, lo
 	}
 }
 
-// SeedIfEmpty seeds the canonical Arunika Digital demo workspace when zero organizations exist.
+// SeedIfEmpty seeds the canonical Arunika Digital demo workspace when zero organizations exist,
+// and backfills missing Corporate-First/HR seed records if org-arunika already exists.
 func (c *Container) SeedIfEmpty(ctx context.Context, fixedDates bool) (bool, error) {
 	return seeddata.SeedArunika(ctx, seeddata.SeedDeps{
 		Store:    c.Store,
@@ -124,6 +125,22 @@ func (c *Container) SeedIfEmpty(ctx context.Context, fixedDates bool) (bool, err
 		Hasher:   c.Hasher,
 		Clock:    c.Clock,
 	}, seeddata.SeedOptions{FixedDates: fixedDates})
+}
+
+// UpgradeArunikaIfPresent non-destructively backfills HR/Corporate-First seed records into an
+// existing org-arunika database (no-op for unrelated production workspaces).
+func (c *Container) UpgradeArunikaIfPresent(ctx context.Context) (bool, error) {
+	return seeddata.UpgradeArunikaIfPresent(ctx, seeddata.SeedDeps{
+		Store:    c.Store,
+		Members:  sqlstore.MemberRepo{Store: c.Store},
+		Projects: sqlstore.ProjectRepo{Store: c.Store},
+		Tasks:    sqlstore.TaskRepo{Store: c.Store},
+		Decs:     sqlstore.DecisionRepo{Store: c.Store},
+		Notifs:   sqlstore.NotificationRepo{Store: c.Store},
+		HR:       sqlstore.HRRepo{Store: c.Store},
+		Hasher:   c.Hasher,
+		Clock:    c.Clock,
+	})
 }
 
 // Close shuts down Redis and database pools gracefully.

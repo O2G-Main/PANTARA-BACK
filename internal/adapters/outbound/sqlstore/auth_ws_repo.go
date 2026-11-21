@@ -531,6 +531,14 @@ func (s *Store) SetSequenceCounters(ctx context.Context, orgID string, nextTaskS
 	return err
 }
 
+// EnsureMinTaskSequence bumps next_task_seq up to minNext without lowering an existing higher counter.
+func (s *Store) EnsureMinTaskSequence(ctx context.Context, orgID string, minNext int) error {
+	_, err := s.exec(ctx).ExecContext(ctx, s.q(`
+		UPDATE organizations SET next_task_seq = $1 WHERE id = $2 AND next_task_seq < $3
+	`), minNext, orgID, minNext)
+	return err
+}
+
 // CreateUser inserts an additional authenticated user account directly (used by seeders).
 func (s *Store) CreateUser(ctx context.Context, u auth.User) error {
 	prefsJSON, _ := json.Marshal(u.NotifyPrefs)

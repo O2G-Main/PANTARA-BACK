@@ -57,14 +57,23 @@ func main() {
 		}
 	}()
 
-	if cfg.AppEnv != "production" && os.Getenv("SEED_DEMO") == "true" {
+	if os.Getenv("SEED_DEMO") == "true" {
 		seedCtx, seedCancel := context.WithTimeout(context.Background(), 20*time.Second)
 		seeded, err := container.SeedIfEmpty(seedCtx, false)
 		seedCancel()
 		if err != nil {
-			log.Warn("dev_seed_warning", "err", err)
+			log.Warn("demo_seed_warning", "err", err)
 		} else if seeded {
-			log.Info("dev_seed_applied", "org", "arunika-digital")
+			log.Info("demo_seed_applied", "org", "arunika-digital")
+		}
+	} else {
+		upCtx, upCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		upgraded, upErr := container.UpgradeArunikaIfPresent(upCtx)
+		upCancel()
+		if upErr != nil {
+			log.Warn("arunika_backfill_warning", "err", upErr)
+		} else if upgraded {
+			log.Info("arunika_backfill_applied", "org", "arunika-digital")
 		}
 	}
 
