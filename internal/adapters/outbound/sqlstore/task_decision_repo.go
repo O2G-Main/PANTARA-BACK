@@ -17,13 +17,14 @@ import (
 func scanTask(row interface{ Scan(...any) error }) (task.Task, error) {
 	var t task.Task
 	var prioStr, statusStr, legacyRaw, asgnsRaw string
-	var actual sql.NullFloat64
-	var dnaRaw sql.NullString
+	var actual, quality sql.NullFloat64
+	var dnaRaw, extraRaw, changeRaw sql.NullString
 	var flowAt sql.NullTime
 
 	err := row.Scan(
-		&t.OrganizationID, &t.ID, &t.ProjectID, &t.PeriodID, &t.Title, &t.Description, &t.DueDate,
-		&prioStr, &statusStr, &t.RemainingHours, &actual, &t.ResponseReason, &legacyRaw, &dnaRaw,
+		&t.OrganizationID, &t.ID, &t.ProjectID, &t.PeriodID, &t.Title, &t.Description, &t.DueDate, &t.DueTime,
+		&prioStr, &statusStr, &t.RemainingHours, &actual, &t.CompletedAt, &quality, &t.ExternalSource,
+		&extraRaw, &t.ResultNote, &changeRaw, &t.ResponseReason, &legacyRaw, &dnaRaw,
 		&asgnsRaw, &flowAt, &t.IsArchived, &t.CreatedBy, &t.CreatedAt, &t.UpdatedAt,
 	)
 	if err != nil {
@@ -32,11 +33,18 @@ func scanTask(row interface{ Scan(...any) error }) (task.Task, error) {
 		}
 		return task.Task{}, errs.Internal("gagal membaca tugas", err)
 	}
+	if t.DueTime == "" {
+		t.DueTime = "17:00"
+	}
 	t.Priority = task.Priority(prioStr)
 	t.Status = task.Status(statusStr)
 	if actual.Valid {
 		v := actual.Float64
 		t.ActualHours = &v
+	}
+	if quality.Valid {
+		v := quality.Float64
+		t.QualityScore = &v
 	}
 	if flowAt.Valid {
 		v := flowAt.Time
@@ -56,10 +64,22 @@ func scanTask(row interface{ Scan(...any) error }) (task.Task, error) {
 			t.DNA = &dna
 		}
 	}
+	if extraRaw.Valid && extraRaw.String != "" {
+		var extra task.ExtraTimeRequest
+		if jErr := json.Unmarshal([]byte(extraRaw.String), &extra); jErr == nil {
+			t.ExtraTime = &extra
+		}
+	}
+	if changeRaw.Valid && changeRaw.String != "" {
+		var cr task.ChangeRequest
+		if jErr := json.Unmarshal([]byte(changeRaw.String), &cr); jErr == nil {
+			t.ChangeRequest = &cr
+		}
+	}
 	return t, nil
 }
 
-const taskCols = `organization_id, id, project_id, period_id, title, description, due_date, priority, status, remaining_hours, actual_hours, response_reason, legacy_competency_ids_json, dna_json, assignments_json, flow_started_at, is_archived, created_by, created_at, updated_at`
+const taskCols = `organization_id, id, project_id, period_id, title, description, due_date, due_time, priority, status, remaining_hours, actual_hours, completed_at, quality_score, external_source, extra_time_json, result_note, change_request_json, response_reason, legacy_competency_ids_json, dna_json, assignments_json, flow_started_at, is_archived, created_by, created_at, updated_at`
 
 func (r TaskRepo) List(ctx context.Context, orgID, periodID string, includeArchived bool) ([]task.Task, error) {
 	q := `SELECT ` + taskCols + ` FROM tasks WHERE organization_id = $1`
@@ -110,7 +130,17 @@ func (r TaskRepo) NextTaskCode(ctx context.Context, orgID string) (string, error
 	return fmt.Sprintf("TGS-%04d", seq), nil
 }
 
-func marshalTaskFields(t task.Task) (legacyRaw, asgnsRaw string, dnaVal sql.NullString, actualVal sql.NullFloat64, flowVal sql.NullTime) {
+func marshalTaskFields(t task.Task) (
+	dueTime string,
+	legacyRaw, asgnsRaw string,
+	dnaVal, extraVal, changeVal sql.NullString,
+	actualVal, qualityVal sql.NullFloat64,
+	flowVal sql.NullTime,
+) {
+	dueTime = t.DueTime
+	if dueTime == "" {
+		dueTime = "17:00"
+	}
 	b1, _ := json.Marshal(t.CompetencyIDs)
 	b2, _ := json.Marshal(t.Assignments)
 	legacyRaw, asgnsRaw = string(b1), string(b2)
@@ -119,8 +149,21 @@ func marshalTaskFields(t task.Task) (legacyRaw, asgnsRaw string, dnaVal sql.Null
 			dnaVal = sql.NullString{String: string(b), Valid: true}
 		}
 	}
+	if t.ExtraTime != nil {
+		if b, err := json.Marshal(t.ExtraTime); err == nil {
+			extraVal = sql.NullString{String: string(b), Valid: true}
+		}
+	}
+	if t.ChangeRequest != nil {
+		if b, err := json.Marshal(t.ChangeRequest); err == nil {
+			changeVal = sql.NullString{String: string(b), Valid: true}
+		}
+	}
 	if t.ActualHours != nil {
 		actualVal = sql.NullFloat64{Float64: *t.ActualHours, Valid: true}
+	}
+	if t.QualityScore != nil {
+		qualityVal = sql.NullFloat64{Float64: *t.QualityScore, Valid: true}
 	}
 	if t.FlowStartedAt != nil {
 		flowVal = sql.NullTime{Time: *t.FlowStartedAt, Valid: true}
@@ -129,20 +172,20 @@ func marshalTaskFields(t task.Task) (legacyRaw, asgnsRaw string, dnaVal sql.Null
 }
 
 func (r TaskRepo) Create(ctx context.Context, t task.Task) error {
-	legacyRaw, asgnsRaw, dnaVal, actualVal, flowVal := marshalTaskFields(t)
+	dueTime, legacyRaw, asgnsRaw, dnaVal, extraVal, changeVal, actualVal, qualityVal, flowVal := marshalTaskFields(t)
 	_, err := r.exec(ctx).ExecContext(ctx, r.q(`
-		INSERT INTO tasks (organization_id, id, project_id, period_id, title, description, due_date, priority, status, remaining_hours, actual_hours, response_reason, legacy_competency_ids_json, dna_json, assignments_json, flow_started_at, is_archived, created_by, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
-	`), t.OrganizationID, t.ID, t.ProjectID, t.PeriodID, t.Title, t.Description, t.DueDate, string(t.Priority), string(t.Status), t.RemainingHours, actualVal, t.ResponseReason, legacyRaw, dnaVal, asgnsRaw, flowVal, t.IsArchived, t.CreatedBy, t.CreatedAt, t.UpdatedAt)
+		INSERT INTO tasks (organization_id, id, project_id, period_id, title, description, due_date, due_time, priority, status, remaining_hours, actual_hours, completed_at, quality_score, external_source, extra_time_json, result_note, change_request_json, response_reason, legacy_competency_ids_json, dna_json, assignments_json, flow_started_at, is_archived, created_by, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
+	`), t.OrganizationID, t.ID, t.ProjectID, t.PeriodID, t.Title, t.Description, t.DueDate, dueTime, string(t.Priority), string(t.Status), t.RemainingHours, actualVal, t.CompletedAt, qualityVal, t.ExternalSource, extraVal, t.ResultNote, changeVal, t.ResponseReason, legacyRaw, dnaVal, asgnsRaw, flowVal, t.IsArchived, t.CreatedBy, t.CreatedAt, t.UpdatedAt)
 	return err
 }
 
 func (r TaskRepo) Update(ctx context.Context, t task.Task) error {
-	legacyRaw, asgnsRaw, dnaVal, actualVal, flowVal := marshalTaskFields(t)
+	dueTime, legacyRaw, asgnsRaw, dnaVal, extraVal, changeVal, actualVal, qualityVal, flowVal := marshalTaskFields(t)
 	res, err := r.exec(ctx).ExecContext(ctx, r.q(`
-		UPDATE tasks SET project_id=$1, period_id=$2, title=$3, description=$4, due_date=$5, priority=$6, status=$7, remaining_hours=$8, actual_hours=$9, response_reason=$10, legacy_competency_ids_json=$11, dna_json=$12, assignments_json=$13, flow_started_at=COALESCE(flow_started_at, $14), is_archived=$15, updated_at=$16
-		WHERE organization_id=$17 AND id=$18
-	`), t.ProjectID, t.PeriodID, t.Title, t.Description, t.DueDate, string(t.Priority), string(t.Status), t.RemainingHours, actualVal, t.ResponseReason, legacyRaw, dnaVal, asgnsRaw, flowVal, t.IsArchived, t.UpdatedAt, t.OrganizationID, t.ID)
+		UPDATE tasks SET project_id=$1, period_id=$2, title=$3, description=$4, due_date=$5, due_time=$6, priority=$7, status=$8, remaining_hours=$9, actual_hours=$10, completed_at=$11, quality_score=$12, external_source=$13, extra_time_json=$14, result_note=$15, change_request_json=$16, response_reason=$17, legacy_competency_ids_json=$18, dna_json=$19, assignments_json=$20, flow_started_at=COALESCE(flow_started_at, $21), is_archived=$22, updated_at=$23
+		WHERE organization_id=$24 AND id=$25
+	`), t.ProjectID, t.PeriodID, t.Title, t.Description, t.DueDate, dueTime, string(t.Priority), string(t.Status), t.RemainingHours, actualVal, t.CompletedAt, qualityVal, t.ExternalSource, extraVal, t.ResultNote, changeVal, t.ResponseReason, legacyRaw, dnaVal, asgnsRaw, flowVal, t.IsArchived, t.UpdatedAt, t.OrganizationID, t.ID)
 	if err != nil {
 		return err
 	}

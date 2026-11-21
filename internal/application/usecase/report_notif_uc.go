@@ -45,6 +45,7 @@ type ReportAndNotifUseCase struct {
 	tasks    port.TaskRepository
 	decs     port.DecisionRepository
 	notifs   port.NotificationRepository
+	hr       port.HRRepository
 	clock    port.Clock
 }
 
@@ -56,6 +57,7 @@ func NewReportAndNotifUseCase(
 	tasks port.TaskRepository,
 	decs port.DecisionRepository,
 	notifs port.NotificationRepository,
+	hr port.HRRepository,
 	clock port.Clock,
 ) *ReportAndNotifUseCase {
 	return &ReportAndNotifUseCase{
@@ -66,6 +68,7 @@ func NewReportAndNotifUseCase(
 		tasks:    tasks,
 		decs:     decs,
 		notifs:   notifs,
+		hr:       hr,
 		clock:    clock,
 	}
 }
@@ -271,51 +274,109 @@ func (uc *ReportAndNotifUseCase) ListNotifications(ctx context.Context, claims a
 				}
 			}
 		}
-	} else if claims.Role.CanManage() {
+	}
+	if claims.Role.CanManage() || claims.Role.CanAccessHR() {
 		members, mErr := uc.members.List(ctx, claims.OrganizationID, p.ID, false)
 		if mErr == nil {
-			openCount := 0
-			for _, t := range tasks {
-				if t.Status == task.StatusOpen {
-					openCount++
+			if claims.Role.CanManage() {
+				openCount := 0
+				for _, t := range tasks {
+					if t.Status == task.StatusOpen {
+						openCount++
+					}
+				}
+				if openCount > 0 {
+					addOp(
+						fmt.Sprintf("open-%d", openCount),
+						fmt.Sprintf("%d tugas belum punya penanggung jawab", openCount),
+						"Mulai dari prioritas tertinggi di Tugas.",
+						"/tugas?status=belum",
+					)
+				}
+				for _, m := range members {
+					if m.AvailableHours == nil {
+						addOp("avail-"+m.ID, "Ketersediaan "+m.Name+" belum diisi", "Belum ikut rekomendasi sampai dilengkapi.", "/tim/"+m.ID)
+					}
+				}
+				for _, t := range tasks {
+					if t.Status == task.StatusOpen && t.ResponseReason != "" {
+						addOp("tolak-"+t.ID, "Penugasan ditolak: "+t.Title, t.ResponseReason, "/tugas/"+t.ID)
+					}
+					if t.ExtraTime != nil && t.ExtraTime.Status == task.ExtraTimePending {
+						addOp(
+							"extra-"+t.ID,
+							"Pengajuan tambah jam: "+t.Title,
+							fmt.Sprintf("+%s jam menunggu persetujuan manajer.", fmtNumberLite(t.ExtraTime.Hours)),
+							"/tugas/"+t.ID,
+						)
+					}
+					if t.ChangeRequest != nil && t.ChangeRequest.Status == "pending" {
+						addOp(
+							"chg-"+t.ID,
+							"Pengajuan perubahan tugas: "+t.Title,
+							t.ChangeRequest.Reason,
+							"/tugas/"+t.ID,
+						)
+					}
+				}
+				for _, r := range engine.ReplanRisks(tasks, members, today) {
+					sub := fmt.Sprintf("%s kekurangan jam sampai tenggat.", r.Member.Name)
+					if r.Kind == "cuti" {
+						sub = fmt.Sprintf("%s cuti sampai tenggat.", r.Member.Name)
+					}
+					addOp("ulang-"+r.Task.ID+"-"+r.Member.ID, "Perlu dijadwalkan ulang: "+r.Task.Title, sub, "/tugas/"+r.Task.ID)
+				}
+				for _, t := range tasks {
+					if t.Status == task.StatusWaiting {
+						addOp("tunggu-"+t.ID, "Menunggu jawaban: "+t.Title, "Ditugaskan, belum dijawab karyawan.", "/tugas/"+t.ID)
+					}
+				}
+				for _, m := range members {
+					for _, lr := range m.LeaveRequests {
+						if lr.CombinedStatus() == member.ApprovalPending && lr.Manager == member.ApprovalPending {
+							addOp(
+								"cuti-mgr-op-"+lr.ID,
+								"Pengajuan cuti menunggu manajer: "+m.Name,
+								fmt.Sprintf("%s (%s - %s)", lr.Type, lr.Start, lr.End),
+								"/tim/"+m.ID,
+							)
+						}
+					}
+					if m.AvailableHours == nil {
+						continue
+					}
+					if near := engine.ClashingDeadline(m.ID, tasks); near != "" {
+						addOp("tenggat-"+m.ID, m.Name+" punya tenggat berdekatan", "Dua tugas aktif jatuh sekitar "+near+".", "/tim/"+m.ID)
+					}
 				}
 			}
-			if openCount > 0 {
-				addOp(
-					fmt.Sprintf("open-%d", openCount),
-					fmt.Sprintf("%d tugas belum punya penanggung jawab", openCount),
-					"Mulai dari prioritas tertinggi di Tugas.",
-					"/tugas?status=belum",
-				)
-			}
-			for _, m := range members {
-				if m.AvailableHours == nil {
-					addOp("avail-"+m.ID, "Ketersediaan "+m.Name+" belum diisi", "Belum ikut rekomendasi sampai dilengkapi.", "/tim/"+m.ID)
+
+			if claims.Role.CanAccessHR() {
+				if uc.hr != nil {
+					if hrReqs, hrErr := uc.hr.ListHRRequests(ctx, claims.OrganizationID, "belum"); hrErr == nil {
+						for _, req := range hrReqs {
+							if !req.Read && !req.Handled {
+								addOp(
+									"hr-req-"+req.ID,
+									"Pengajuan HR baru: "+req.Title,
+									fmt.Sprintf("Dari %s (%s)", req.Sender, req.SenderRole),
+									"/hr/inbox",
+								)
+							}
+						}
+					}
 				}
-			}
-			for _, t := range tasks {
-				if t.Status == task.StatusOpen && t.ResponseReason != "" {
-					addOp("tolak-"+t.ID, "Penugasan ditolak: "+t.Title, t.ResponseReason, "/tugas/"+t.ID)
-				}
-			}
-			for _, r := range engine.ReplanRisks(tasks, members, today) {
-				sub := fmt.Sprintf("%s kekurangan jam sampai tenggat.", r.Member.Name)
-				if r.Kind == "cuti" {
-					sub = fmt.Sprintf("%s cuti sampai tenggat.", r.Member.Name)
-				}
-				addOp("ulang-"+r.Task.ID+"-"+r.Member.ID, "Perlu dijadwalkan ulang: "+r.Task.Title, sub, "/tugas/"+r.Task.ID)
-			}
-			for _, t := range tasks {
-				if t.Status == task.StatusWaiting {
-					addOp("tunggu-"+t.ID, "Menunggu jawaban: "+t.Title, "Ditugaskan, belum dijawab karyawan.", "/tugas/"+t.ID)
-				}
-			}
-			for _, m := range members {
-				if m.AvailableHours == nil {
-					continue
-				}
-				if near := engine.ClashingDeadline(m.ID, tasks); near != "" {
-					addOp("tenggat-"+m.ID, m.Name+" punya tenggat berdekatan", "Dua tugas aktif jatuh sekitar "+near+".", "/tim/"+m.ID)
+				for _, m := range members {
+					for _, lr := range m.LeaveRequests {
+						if lr.CombinedStatus() == member.ApprovalPending && lr.HR == member.ApprovalPending {
+							addOp(
+								"cuti-hr-op-"+lr.ID,
+								"Pengajuan cuti menunggu HR: "+m.Name,
+								fmt.Sprintf("%s (%s - %s)", lr.Type, lr.Start, lr.End),
+								"/hr/inbox",
+							)
+						}
+					}
 				}
 			}
 		}

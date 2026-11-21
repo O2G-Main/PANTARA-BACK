@@ -250,6 +250,17 @@ func RankCandidates(
 		presetDef = Presets[workspace.PresetSeimbang]
 	}
 	w := EffectiveWeights(settings.Preset, complexity)
+	// Kapasitas cadangan hanya terbuka untuk tugas prioritas tinggi.
+	openRatio := 1.0
+	if t.Priority != task.PriorityHigh {
+		rr := settings.ReserveRatio
+		if rr < 0 {
+			rr = 0
+		} else if rr > 0.3 {
+			rr = 0.3
+		}
+		openRatio = 1.0 - rr
+	}
 
 	candidates := make([]Candidate, 0, len(members))
 	filtered := make([]FilteredCandidate, 0)
@@ -265,7 +276,7 @@ func RankCandidates(
 			})
 			continue
 		}
-		available := *m.AvailableHours
+		available := *m.AvailableHours * openRatio
 		var failures []string
 
 		work := Workdays(today, t.DueDate)
@@ -280,7 +291,7 @@ func RankCandidates(
 			}
 		}
 
-		free := HoursUntil(m, t.DueDate, today) - CommittedUntil(m.ID, t.DueDate, tasks, t.ID)
+		free := HoursUntil(m, t.DueDate, today)*openRatio - CommittedUntil(m.ID, t.DueDate, tasks, t.ID)
 		if len(work) > 0 && leaveDays == len(work) {
 			failures = append(failures, "Cuti di semua hari kerja sampai tenggat")
 		} else if free < effort*0.5 {

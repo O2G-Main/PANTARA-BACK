@@ -9,14 +9,15 @@ import (
 type Kind string
 
 const (
-	KindValidation   Kind = "validation"
-	KindUnauthorized Kind = "unauthorized"
-	KindForbidden    Kind = "forbidden"
-	KindNotFound     Kind = "not_found"
-	KindConflict     Kind = "conflict"
-	KindLocked       Kind = "locked"
-	KindRateLimit    Kind = "rate_limit"
-	KindInternal     Kind = "internal"
+	KindValidation    Kind = "validation"
+	KindUnauthorized  Kind = "unauthorized"
+	KindForbidden     Kind = "forbidden"
+	KindNotFound      Kind = "not_found"
+	KindConflict      Kind = "conflict"
+	KindUnprocessable Kind = "unprocessable"
+	KindLocked        Kind = "locked"
+	KindRateLimit     Kind = "rate_limit"
+	KindInternal      Kind = "internal"
 )
 
 // Error is a structured domain error carrying a safe client-facing message and field hints.
@@ -60,6 +61,15 @@ func NotFound(msg string) *Error {
 
 func Conflict(msg string) *Error {
 	return &Error{Kind: KindConflict, Code: "conflict", Message: msg}
+}
+
+func Unprocessable(msg string) *Error {
+	return &Error{Kind: KindUnprocessable, Code: "unprocessable", Message: msg}
+}
+
+// WithCode constructs a domain error carrying an explicit machine-readable contract code.
+func WithCode(kind Kind, code, msg string) *Error {
+	return &Error{Kind: kind, Code: code, Message: msg}
 }
 
 func Locked(msg string) *Error {

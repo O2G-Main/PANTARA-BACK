@@ -161,3 +161,33 @@ func requireAdmin(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
+func requireHR(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := claimsFromCtx(r.Context())
+		if !ok {
+			writeError(w, r, errs.Unauthorized("Silakan masuk terlebih dahulu."))
+			return
+		}
+		if !claims.Role.CanAccessHR() {
+			writeError(w, r, errs.Forbidden("Halaman dan aksi ini khusus HR atau admin."))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func requireManagerOrHR(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := claimsFromCtx(r.Context())
+		if !ok {
+			writeError(w, r, errs.Unauthorized("Silakan masuk terlebih dahulu."))
+			return
+		}
+		if !claims.Role.CanManage() && !claims.Role.CanAccessHR() {
+			writeError(w, r, errs.Forbidden("Aksi ini khusus manajer, HR, atau admin."))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}

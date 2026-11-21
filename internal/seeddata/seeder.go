@@ -32,6 +32,7 @@ type SeedDeps struct {
 	Tasks    port.TaskRepository
 	Decs     port.DecisionRepository
 	Notifs   port.NotificationRepository
+	HR       port.HRRepository
 	Hasher   port.PasswordHasher
 	Clock    port.Clock
 }
@@ -209,6 +210,33 @@ func SeedArunika(ctx context.Context, deps SeedDeps, opts SeedOptions) (bool, er
 			return err
 		}
 
+		hrUser := auth.User{
+			ID:             "usr-hr-arunika",
+			OrganizationID: ArunikaOrgID,
+			MemberID:       "",
+			Email:          "hr@pantara.id",
+			Name:           "Nadia Putri (HR)",
+			PasswordHash:   pwHash,
+			Role:           auth.RoleHR,
+			IsActive:       true,
+			SessionVersion: 1,
+			NotifyPrefs:    auth.DefaultNotifyPrefs(),
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		if err := deps.Store.CreateUser(txCtx, hrUser); err != nil {
+			return err
+		}
+
+		if deps.HR != nil {
+			if err := deps.HR.SaveHRSettings(txCtx, ArunikaOrgID, workspace.DefaultHRSettings()); err != nil {
+				return err
+			}
+			if err := deps.HR.SavePerformanceConfig(txCtx, ArunikaOrgID, workspace.DefaultPerformanceConfig()); err != nil {
+				return err
+			}
+		}
+
 		bimaUser := auth.User{
 			ID:             "usr-member-bima",
 			OrganizationID: ArunikaOrgID,
@@ -242,12 +270,26 @@ func SeedArunika(ctx context.Context, deps SeedDeps, opts SeedOptions) (bool, er
 			if !m.Access.IsValid() {
 				m.Access = auth.RoleMember
 			}
+			if !m.EmploymentType.IsValid() {
+				m.EmploymentType = member.EmploymentEmployee
+			}
 			m.IsActive = true
 			shiftedLeave := make([]string, len(m.LeaveDates))
 			for idx, ld := range m.LeaveDates {
 				shiftedLeave[idx] = shiftDate(ld)
 			}
 			m.LeaveDates = shiftedLeave
+			if len(m.LeaveRequests) > 0 {
+				reqs := make([]member.LeaveRequest, len(m.LeaveRequests))
+				for idx, lr := range m.LeaveRequests {
+					lr.MemberID = m.ID
+					lr.Start = shiftDate(lr.Start)
+					lr.End = shiftDate(lr.End)
+					lr.RequestedAt = shiftTimestamp(lr.RequestedAt)
+					reqs[idx] = lr
+				}
+				m.LeaveRequests = reqs
+			}
 			if err := deps.Members.Create(txCtx, ArunikaOrgID, ActivePeriodID, m); err != nil {
 				return err
 			}
@@ -274,7 +316,13 @@ func SeedArunika(ctx context.Context, deps SeedDeps, opts SeedOptions) (bool, er
 			t.OrganizationID = ArunikaOrgID
 			t.PeriodID = ActivePeriodID
 			t.DueDate = shiftDate(t.DueDate)
+			t.CompletedAt = shiftDate(t.CompletedAt)
 			t.CreatedAt = shiftTimestamp(t.CreatedAt)
+			if t.ExtraTime != nil {
+				et := *t.ExtraTime
+				et.RequestedAt = shiftTimestamp(et.RequestedAt)
+				t.ExtraTime = &et
+			}
 			t.CreatedBy = adminUser.ID
 			t.UpdatedAt = now
 			if seq := parseCodeNum(t.ID, "TGS-"); seq > maxTaskSeq {

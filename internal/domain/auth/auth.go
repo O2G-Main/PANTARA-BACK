@@ -9,11 +9,12 @@ const (
 	RoleAdmin   Role = "admin"
 	RoleManager Role = "manajer"
 	RoleMember  Role = "anggota"
+	RoleHR      Role = "hr"
 )
 
 // IsValid checks whether the role is one of the supported canonical values.
 func (r Role) IsValid() bool {
-	return r == RoleAdmin || r == RoleManager || r == RoleMember
+	return r == RoleAdmin || r == RoleManager || r == RoleMember || r == RoleHR
 }
 
 // CanManage reports whether the role has operational manager privileges.
@@ -26,8 +27,21 @@ func (r Role) CanAdminister() bool {
 	return r == RoleAdmin
 }
 
+// IsHR reports whether the role is the dedicated HR workspace role.
+func (r Role) IsHR() bool {
+	return r == RoleHR
+}
+
+// CanAccessHR reports whether the role can administer HR data/settings alongside admin.
+func (r Role) CanAccessHR() bool {
+	return r == RoleHR || r == RoleAdmin
+}
+
 // HomePath returns the default frontend landing route for the user role.
 func (r Role) HomePath() string {
+	if r == RoleHR {
+		return "/hr"
+	}
 	if r.CanManage() {
 		return "/dashboard"
 	}

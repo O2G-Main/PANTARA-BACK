@@ -41,9 +41,9 @@ func (s *Store) CreateWorkspaceBootstrap(
 	}
 
 	if _, err := ex.ExecContext(ctx, s.q(`
-		INSERT INTO recommendation_settings (organization_id, preset, level_tolerance, overload_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5)
-	`), org.ID, string(settings.Preset), settings.LevelTolerance, settings.OverloadAt, org.CreatedAt); err != nil {
+		INSERT INTO recommendation_settings (organization_id, preset, level_tolerance, overload_at, reserve_ratio, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+	`), org.ID, string(settings.Preset), settings.LevelTolerance, settings.OverloadAt, settings.ReserveRatio, org.CreatedAt); err != nil {
 		return errs.Internal("gagal membuat pengaturan rekomendasi", err)
 	}
 
@@ -497,8 +497,8 @@ func (s *Store) GetEngineSettings(ctx context.Context, orgID string) (workspace.
 	var set workspace.EngineSettings
 	var presetStr string
 	err := s.exec(ctx).QueryRowContext(ctx, s.q(`
-		SELECT preset, level_tolerance, overload_at FROM recommendation_settings WHERE organization_id = $1
-	`), orgID).Scan(&presetStr, &set.LevelTolerance, &set.OverloadAt)
+		SELECT preset, level_tolerance, overload_at, reserve_ratio FROM recommendation_settings WHERE organization_id = $1
+	`), orgID).Scan(&presetStr, &set.LevelTolerance, &set.OverloadAt, &set.ReserveRatio)
 	if err != nil {
 		if isNoRows(err) {
 			return workspace.DefaultEngineSettings(), nil
@@ -511,14 +511,15 @@ func (s *Store) GetEngineSettings(ctx context.Context, orgID string) (workspace.
 
 func (s *Store) SaveEngineSettings(ctx context.Context, orgID string, set workspace.EngineSettings) error {
 	_, err := s.exec(ctx).ExecContext(ctx, s.q(`
-		INSERT INTO recommendation_settings (organization_id, preset, level_tolerance, overload_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO recommendation_settings (organization_id, preset, level_tolerance, overload_at, reserve_ratio, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (organization_id) DO UPDATE SET
 			preset = EXCLUDED.preset,
 			level_tolerance = EXCLUDED.level_tolerance,
 			overload_at = EXCLUDED.overload_at,
+			reserve_ratio = EXCLUDED.reserve_ratio,
 			updated_at = EXCLUDED.updated_at
-	`), orgID, string(set.Preset), set.LevelTolerance, set.OverloadAt, time.Now().UTC())
+	`), orgID, string(set.Preset), set.LevelTolerance, set.OverloadAt, set.ReserveRatio, time.Now().UTC())
 	return err
 }
 

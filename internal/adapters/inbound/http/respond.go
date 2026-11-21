@@ -95,6 +95,8 @@ func httpStatusFor(kind errs.Kind) int {
 		return http.StatusNotFound
 	case errs.KindConflict:
 		return http.StatusConflict
+	case errs.KindUnprocessable:
+		return http.StatusUnprocessableEntity
 	case errs.KindLocked:
 		return http.StatusLocked
 	case errs.KindRateLimit:

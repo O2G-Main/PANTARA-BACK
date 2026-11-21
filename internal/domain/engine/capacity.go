@@ -2,6 +2,7 @@ package engine
 
 import (
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/Orang2-BU/pantara-back/internal/domain/member"
@@ -13,13 +14,15 @@ const (
 	LoadKnee        = 0.15
 	DefaultOverrun  = 1.5
 	MinSamples      = 5
+	ExtraTimeWindow = 2 * time.Hour
 )
 
 // ReplanRisk flags an active task whose assignee cannot finish it on time.
 type ReplanRisk struct {
-	Task   task.Task     `json:"task"`
-	Member member.Member `json:"member"`
-	Kind   string        `json:"kind"` // "cuti" | "kurang-jam"
+	Task      task.Task     `json:"task"`
+	Member    member.Member `json:"member"`
+	Kind      string        `json:"kind"` // "cuti" | "kurang-jam"
+	Shortfall float64       `json:"shortfall"`
 }
 
 // WeekBucket tracks projected hours vs capacity for one Monday..Friday week.
@@ -173,17 +176,204 @@ func ReplanRisks(tasks []task.Task, members []member.Member, today string) []Rep
 				continue
 			}
 			avail := HoursUntil(m, t.DueDate, today)
+			committed := CommittedUntil(m.ID, t.DueDate, tasks, "")
 			if avail == 0 {
-				risks = append(risks, ReplanRisk{Task: t, Member: m, Kind: "cuti"})
+				risks = append(risks, ReplanRisk{Task: t, Member: m, Kind: "cuti", Shortfall: committed})
 				continue
 			}
-			committed := CommittedUntil(m.ID, t.DueDate, tasks, "")
 			if committed > avail+0.01 {
-				risks = append(risks, ReplanRisk{Task: t, Member: m, Kind: "kurang-jam"})
+				risks = append(risks, ReplanRisk{Task: t, Member: m, Kind: "kurang-jam", Shortfall: committed - avail})
 			}
 		}
 	}
 	return risks
+}
+
+// DeadlineAt resolves the exact WIB (+07:00) deadline timestamp for a task (default 17:00).
+func DeadlineAt(dueDate, dueTime string) (time.Time, error) {
+	datePart := strings.TrimSpace(dueDate)
+	if len(datePart) > 10 {
+		datePart = datePart[:10]
+	}
+	tPart := strings.TrimSpace(dueTime)
+	if tPart == "" {
+		tPart = "17:00"
+	}
+	return time.Parse("2006-01-02T15:04:05-07:00", datePart+"T"+tPart+":00+07:00")
+}
+
+// CanRequestExtraTime reports whether a running task is within 2 hours of deadline and has no pending extra-time request.
+func CanRequestExtraTime(t task.Task, now time.Time) bool {
+	if t.Status != task.StatusRunning {
+		return false
+	}
+	if t.ExtraTime != nil && t.ExtraTime.Status == task.ExtraTimePending {
+		return false
+	}
+	dl, err := DeadlineAt(t.DueDate, t.DueTime)
+	if err != nil {
+		return false
+	}
+	return dl.Sub(now) <= ExtraTimeWindow
+}
+
+// DecideExtraTime applies a manager approval or rejection to a pending extra-time request (deadline stays fixed).
+func DecideExtraTime(t task.Task, approve bool) (task.Task, bool) {
+	if t.ExtraTime == nil || t.ExtraTime.Status != task.ExtraTimePending {
+		return t, false
+	}
+	req := *t.ExtraTime
+	if !approve {
+		req.Status = task.ExtraTimeRejected
+		t.ExtraTime = &req
+		return t, true
+	}
+	req.Status = task.ExtraTimeApproved
+	t.ExtraTime = &req
+	t.RemainingHours += req.Hours
+	asgns := make([]task.Assignment, len(t.Assignments))
+	copy(asgns, t.Assignments)
+	for i := range asgns {
+		if asgns[i].MemberID == req.MemberID {
+			asgns[i].Hours += req.Hours
+		}
+	}
+	t.Assignments = asgns
+	return t, true
+}
+
+// ValidateLeaveRequest validates leave submission dates, workdays presence, and reason length.
+func ValidateLeaveRequest(start, end, reason, today string) string {
+	if strings.TrimSpace(start) == "" || strings.TrimSpace(end) == "" {
+		return "Pilih tanggal mulai dan selesai."
+	}
+	if start < today {
+		return "Tanggal mulai tidak boleh sebelum hari ini."
+	}
+	if end < start {
+		return "Tanggal selesai tidak boleh sebelum tanggal mulai."
+	}
+	if len(Workdays(start, end)) == 0 {
+		return "Rentang tanggal tidak berisi hari kerja."
+	}
+	if len([]rune(strings.TrimSpace(reason))) < 10 {
+		return "Tulis alasan minimal 10 karakter."
+	}
+	return ""
+}
+
+// DecideLeave records a manager or HR decision; once both approve, workdays in [start..end] are merged into LeaveDates.
+func DecideLeave(m member.Member, reqID, by string, approve bool) (member.Member, *member.LeaveRequest, bool) {
+	if by != "manager" && by != "hr" {
+		return m, nil, false
+	}
+	reqs := make([]member.LeaveRequest, len(m.LeaveRequests))
+	copy(reqs, m.LeaveRequests)
+	idx := -1
+	for i := range reqs {
+		if reqs[i].ID == reqID {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return m, nil, false
+	}
+	cur := reqs[idx]
+	if cur.CombinedStatus() != member.ApprovalPending {
+		return m, nil, false
+	}
+	if (by == "manager" && cur.Manager != member.ApprovalPending) || (by == "hr" && cur.HR != member.ApprovalPending) {
+		return m, nil, false
+	}
+	decision := member.ApprovalRejected
+	if approve {
+		decision = member.ApprovalApproved
+	}
+	if by == "manager" {
+		cur.Manager = decision
+	} else {
+		cur.HR = decision
+	}
+	reqs[idx] = cur
+	m.LeaveRequests = reqs
+
+	if cur.CombinedStatus() == member.ApprovalApproved {
+		set := make(map[string]struct{}, len(m.LeaveDates)+10)
+		for _, d := range m.LeaveDates {
+			set[d] = struct{}{}
+		}
+		for _, d := range Workdays(cur.Start, cur.End) {
+			set[d] = struct{}{}
+		}
+		merged := make([]string, 0, len(set))
+		for d := range set {
+			merged = append(merged, d)
+		}
+		sort.Strings(merged)
+		m.LeaveDates = merged
+	}
+	return m, &cur, true
+}
+
+// AutomaticPerformance computes on-time rate, average quality, and combined automatic score for a month (YYYY-MM).
+func AutomaticPerformance(tasks []task.Task, memberID, period string) (onTime, quality, score *float64) {
+	var completed []task.Task
+	missingDates := false
+	for _, t := range tasks {
+		if t.Status != task.StatusDone {
+			continue
+		}
+		assigned := false
+		for _, a := range t.Assignments {
+			if a.MemberID == memberID {
+				assigned = true
+				break
+			}
+		}
+		if !assigned {
+			continue
+		}
+		if strings.TrimSpace(t.CompletedAt) == "" {
+			missingDates = true
+			continue
+		}
+		if strings.HasPrefix(t.CompletedAt, period) {
+			completed = append(completed, t)
+		}
+	}
+	if len(completed) == 0 || missingDates {
+		return nil, nil, nil
+	}
+
+	onTimeCount := 0
+	allQuality := true
+	sumQuality := 0.0
+	for _, t := range completed {
+		compDay := t.CompletedAt
+		if len(compDay) > 10 {
+			compDay = compDay[:10]
+		}
+		dueDay := t.DueDate
+		if len(dueDay) > 10 {
+			dueDay = dueDay[:10]
+		}
+		if compDay <= dueDay {
+			onTimeCount++
+		}
+		if t.QualityScore == nil {
+			allQuality = false
+		} else {
+			sumQuality += *t.QualityScore
+		}
+	}
+	onTimeVal := float64(onTimeCount) / float64(len(completed)) * 100.0
+	if !allQuality {
+		return &onTimeVal, nil, nil
+	}
+	qualVal := sumQuality / float64(len(completed))
+	scoreVal := (onTimeVal + qualVal) / 2.0
+	return &onTimeVal, &qualVal, &scoreVal
 }
 
 func mondayOf(iso string) string {

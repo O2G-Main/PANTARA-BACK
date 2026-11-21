@@ -210,3 +210,34 @@ func TestRankCandidatesEdgeCases(t *testing.T) {
 		t.Fatalf("expected second twin tiedWithPrev=true, got %+v", resTwin.Candidates)
 	}
 }
+
+func TestReserveRatioCapacity(t *testing.T) {
+	ds, authCorrected, names := loadSeedEngineFixture(t)
+	findBima := func(res engine.RankResult) engine.Candidate {
+		for _, c := range res.Candidates {
+			if c.Member.ID == "bima" {
+				return c
+			}
+		}
+		t.Fatalf("bima not found in candidates")
+		return engine.Candidate{}
+	}
+
+	baseSettings := workspace.DefaultEngineSettings()
+	reserveSettings := baseSettings
+	reserveSettings.ReserveRatio = 0.2
+
+	normalTask := authCorrected
+	normalTask.Priority = task.PriorityNormal
+	bimaBase := findBima(engine.RankCandidates(normalTask, ds.Members, ds.Tasks, baseSettings, names, testToday))
+	bimaReserve := findBima(engine.RankCandidates(normalTask, ds.Members, ds.Tasks, reserveSettings, names, testToday))
+	if !(bimaReserve.UtilAfter > bimaBase.UtilAfter && bimaReserve.Free < bimaBase.Free) {
+		t.Fatalf("expected reserveRatio to reduce open capacity for normal tasks")
+	}
+
+	urgentTask := authCorrected
+	urgentTask.Priority = task.PriorityHigh
+	bimaUrgentBase := findBima(engine.RankCandidates(urgentTask, ds.Members, ds.Tasks, baseSettings, names, testToday))
+	bimaUrgentReserve := findBima(engine.RankCandidates(urgentTask, ds.Members, ds.Tasks, reserveSettings, names, testToday))
+	approxEqual(t, bimaUrgentReserve.UtilAfter, bimaUrgentBase.UtilAfter, 1e-6, "urgent task bypasses reserveRatio")
+}

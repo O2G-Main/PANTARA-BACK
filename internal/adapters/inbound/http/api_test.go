@@ -225,17 +225,41 @@ func TestRBACAndCrossTenantIsolation(t *testing.T) {
 		}
 	}
 
-	// 3. Manager cannot hit Admin-only settings, billing, or member access change
+	// 3. Manager cannot hit Admin-only workspace/billing/access, HR-only availability, or HR console endpoints
 	for _, ep := range []struct{ m, p string }{
 		{"PATCH", "/api/v1/workspace"},
-		{"GET", "/api/v1/workspace/settings"},
-		{"PATCH", "/api/v1/workspace/settings"},
 		{"GET", "/api/v1/workspace/billing"},
 		{"PATCH", "/api/v1/members/bima/access"},
+		{"PUT", "/api/v1/members/bima/availability"},
+		{"GET", "/api/v1/hr/settings"},
+		{"POST", "/api/v1/hr/divisions"},
 	} {
 		rForb, _ := env.do(ep.m, ep.p, mgrTok, nil, map[string]any{})
 		if rForb.StatusCode != http.StatusForbidden {
 			t.Fatalf("manajer %s %s expected 403, got %d", ep.m, ep.p, rForb.StatusCode)
+		}
+	}
+
+	// 3b. Manager can read/update engine settings (e.g. reserveRatio), while Anggota & HR cannot
+	rMgrSet, _ := env.do("GET", "/api/v1/workspace/settings", mgrTok, nil, nil)
+	if rMgrSet.StatusCode != http.StatusOK {
+		t.Fatalf("manajer GET /workspace/settings expected 200, got %d", rMgrSet.StatusCode)
+	}
+	hrTok, _, _, _ := env.login("hr@pantara.id", seeddata.DemoPassword)
+	for _, tok := range []string{bimaTok, hrTok} {
+		rSetForb, _ := env.do("GET", "/api/v1/workspace/settings", tok, nil, nil)
+		if rSetForb.StatusCode != http.StatusForbidden {
+			t.Fatalf("non-manager GET /workspace/settings expected 403, got %d", rSetForb.StatusCode)
+		}
+	}
+	// HR cannot create tasks or hit billing
+	for _, ep := range []struct{ m, p string }{
+		{"POST", "/api/v1/tasks"},
+		{"GET", "/api/v1/workspace/billing"},
+	} {
+		rHRForb, _ := env.do(ep.m, ep.p, hrTok, nil, map[string]any{})
+		if rHRForb.StatusCode != http.StatusForbidden {
+			t.Fatalf("hr %s %s expected 403, got %d", ep.m, ep.p, rHRForb.StatusCode)
 		}
 	}
 
@@ -662,5 +686,415 @@ func TestCookieSecureAutoProxyHeader(t *testing.T) {
 		if !ck.Secure {
 			t.Fatalf("expected secure cookie behind X-Forwarded-Proto: https for %s", ck.Name)
 		}
+	}
+}
+
+type controllableClock struct {
+	mu  sync.RWMutex
+	now time.Time
+}
+
+func (c *controllableClock) Now() time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.now
+}
+
+func (c *controllableClock) Set(t time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = t
+}
+
+func TestCorporateFirstAndHRWorkflows(t *testing.T) {
+	jakarta := time.FixedZone("WIB", 7*3600)
+	clk := &controllableClock{now: time.Date(2026, 9, 29, 10, 0, 0, 0, jakarta)}
+
+	store, err := sqlstore.OpenSQLite(":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite memory: %v", err)
+	}
+	if err := store.Migrate(context.Background()); err != nil {
+		_ = store.Close()
+		t.Fatalf("migrate sqlite: %v", err)
+	}
+	cfg := config.Config{
+		AppEnv:             "test",
+		CORSAllowedOrigins: []string{"http://localhost:3000"},
+		JWTSecret:          "pantara-unit-test-secret-32-bytes-minimum-key",
+		AppBaseURL:         "http://localhost:3000",
+		AIModel:            "gpt-4o-mini",
+		AITimeout:          5 * time.Second,
+	}
+	c := app.NewContainer(cfg, store, clk, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if _, err := c.SeedIfEmpty(context.Background(), true); err != nil {
+		_ = c.Close()
+		t.Fatalf("seed fixed dates: %v", err)
+	}
+	srv := httptest.NewServer(c.Handler)
+	t.Cleanup(func() {
+		srv.Close()
+		_ = c.Close()
+	})
+	env := &testEnv{t: t, container: c, server: srv}
+
+	adminTok, _, _, _ := env.login("krisna@pantara.id", seeddata.DemoPassword)
+	mgrTok, _, _, _ := env.login("manajer@pantara.id", seeddata.DemoPassword)
+	hrTok, _, rHRLogin, bHRLogin := env.login("hr@pantara.id", seeddata.DemoPassword)
+	if rHRLogin.StatusCode != http.StatusOK || !strings.Contains(string(bHRLogin), `"home":"/hr"`) {
+		t.Fatalf("hr login failed or wrong home: %d %s", rHRLogin.StatusCode, string(bHRLogin))
+	}
+	bimaTok, _, _, _ := env.login("bima@pantara.id", seeddata.DemoPassword)
+
+	// 1. PUT /saya/availability is blocked (403)
+	rSav, _ := env.do("PUT", "/api/v1/saya/availability", bimaTok, nil, map[string]any{"availableHours": 40})
+	if rSav.StatusCode != http.StatusForbidden {
+		t.Fatalf("PUT /saya/availability expected 403, got %d", rSav.StatusCode)
+	}
+
+	// 2. Freelancer vs Employee task rejection + extra time lifecycle
+	rInvFl, bInvFl := env.do("POST", "/api/v1/members", hrTok, nil, map[string]any{
+		"name":           "Dina Freelance",
+		"email":          "dina@pantara.id",
+		"role":           "Backend Freelancer",
+		"employmentType": "freelancer",
+		"division":       "Engineering",
+		"team":           "Platform",
+	})
+	if rInvFl.StatusCode != http.StatusCreated {
+		t.Fatalf("hr invite freelancer failed: %d %s", rInvFl.StatusCode, string(bInvFl))
+	}
+	var flInv struct {
+		InviteToken string `json:"inviteToken"`
+		Member      struct {
+			ID string `json:"id"`
+		} `json:"member"`
+	}
+	_ = json.Unmarshal(bInvFl, &flInv)
+	_, _ = env.do("POST", "/api/v1/auth/accept-invite", "", nil, map[string]any{
+		"token": flInv.InviteToken, "name": "Dina Freelance", "password": "password1234",
+	})
+	dinaTok, _, _, _ := env.login("dina@pantara.id", "password1234")
+	_, _ = env.do("PUT", "/api/v1/members/"+flInv.Member.ID+"/availability", hrTok, nil, map[string]any{
+		"availableHours": 30, "weeklyLimit": 30, "leaveDates": []string{},
+	})
+
+	// Create task due 2026-10-01 17:00 WIB, confirm DNA & assign to Bima
+	rTC, bTC := env.do("POST", "/api/v1/tasks", mgrTok, nil, map[string]any{
+		"projectId":   "klinik",
+		"title":       "Implementasi Webhook Pembayaran",
+		"description": "Bangun endpoint webhook pembayaran dan validasi signature HMAC.",
+		"dueDate":     "2026-10-01",
+		"dueTime":     "17:00",
+		"priority":    "normal",
+	})
+	if rTC.StatusCode != http.StatusCreated {
+		t.Fatalf("create task failed: %d %s", rTC.StatusCode, string(bTC))
+	}
+	var tcResp struct {
+		Task struct {
+			ID string `json:"id"`
+		} `json:"task"`
+	}
+	_ = json.Unmarshal(bTC, &tcResp)
+	taskID := tcResp.Task.ID
+
+	rConfB, bConfB := env.do("PUT", "/api/v1/tasks/"+taskID+"/confirm-dna", mgrTok, nil, map[string]any{
+		"requirements": []map[string]any{{"competencyId": "backend-api", "level": 2, "p": 1.0, "quote": "webhook backend API"}},
+		"complexity":   3, "effortHours": 4, "effortSize": "S", "dependencies": []any{},
+	})
+	if rConfB.StatusCode != http.StatusOK {
+		t.Fatalf("confirm DNA failed: %d %s", rConfB.StatusCode, string(bConfB))
+	}
+	rAsg, bAsg := env.do("POST", "/api/v1/tasks/"+taskID+"/assign", mgrTok, nil, map[string]any{
+		"assignments": []map[string]any{{"memberId": "bima", "hours": 4}},
+		"preset":      "seimbang",
+		"reasonCode":  "lainnya",
+		"note":        "Uji alur penugasan Bima.",
+	})
+	if rAsg.StatusCode != http.StatusOK {
+		t.Fatalf("assign task to bima failed: %d %s", rAsg.StatusCode, string(bAsg))
+	}
+
+	// Employee cannot reject assignment (403 reject_not_allowed)
+	rRejEmp, bRejEmp := env.do("POST", "/api/v1/saya/tasks/"+taskID+"/respond", bimaTok, nil, map[string]any{
+		"accept": false, "reason": "Terlalu banyak beban minggu ini untuk dikerjakan.",
+	})
+	if rRejEmp.StatusCode != http.StatusForbidden || !strings.Contains(string(bRejEmp), "reject_not_allowed") {
+		t.Fatalf("expected 403 reject_not_allowed, got %d %s", rRejEmp.StatusCode, string(bRejEmp))
+	}
+
+	// Employee accepts assignment
+	rAccEmp, _ := env.do("POST", "/api/v1/saya/tasks/"+taskID+"/respond", bimaTok, nil, map[string]any{"accept": true})
+	if rAccEmp.StatusCode != http.StatusOK {
+		t.Fatalf("bima accept failed: %d", rAccEmp.StatusCode)
+	}
+
+	// Non-assignee gets 403 not_assignee; early request gets 422 too_early
+	rNotAsg, bNotAsg := env.do("POST", "/api/v1/saya/tasks/"+taskID+"/extra-time", dinaTok, nil, map[string]any{
+		"hours": 2, "reason": "Saya tidak mengerjakan ini tapi coba minta waktu.",
+	})
+	if rNotAsg.StatusCode != http.StatusForbidden || !strings.Contains(string(bNotAsg), "not_assignee") {
+		t.Fatalf("expected 403 not_assignee, got %d %s", rNotAsg.StatusCode, string(bNotAsg))
+	}
+
+	rEarly, bEarly := env.do("POST", "/api/v1/saya/tasks/"+taskID+"/extra-time", bimaTok, nil, map[string]any{
+		"hours": 2, "reason": "Masih dua hari sebelum deadline tapi minta tambahan.",
+	})
+	if rEarly.StatusCode != http.StatusUnprocessableEntity || !strings.Contains(string(bEarly), "too_early") {
+		t.Fatalf("expected 422 too_early, got %d %s", rEarly.StatusCode, string(bEarly))
+	}
+
+	// Move clock to 2026-10-01 15:30 WIB (within 2h of 17:00 deadline) -> 200 OK
+	clk.Set(time.Date(2026, 10, 1, 15, 30, 0, 0, jakarta))
+	rET, bET := env.do("POST", "/api/v1/saya/tasks/"+taskID+"/extra-time", bimaTok, nil, map[string]any{
+		"hours": 2, "reason": "Butuh tambahan waktu untuk pengujian edge case webhook.",
+	})
+	if rET.StatusCode != http.StatusOK || !strings.Contains(string(bET), `"status":"menunggu"`) {
+		t.Fatalf("extra-time request failed: %d %s", rET.StatusCode, string(bET))
+	}
+	// Duplicate pending request -> 409 extra_time_pending
+	rETDup, bETDup := env.do("POST", "/api/v1/saya/tasks/"+taskID+"/extra-time", bimaTok, nil, map[string]any{
+		"hours": 1, "reason": "Coba kirim pengajuan tambahan kedua saat masih menunggu.",
+	})
+	if rETDup.StatusCode != http.StatusConflict || !strings.Contains(string(bETDup), "extra_time_pending") {
+		t.Fatalf("expected 409 extra_time_pending, got %d %s", rETDup.StatusCode, string(bETDup))
+	}
+
+	// Manager approves extra-time -> remainingHours becomes 6 (4+2), dueDate stays 2026-10-01
+	rETDec, bETDec := env.do("POST", "/api/v1/tasks/"+taskID+"/extra-time/decision", mgrTok, nil, map[string]any{"approve": true})
+	if rETDec.StatusCode != http.StatusOK || !strings.Contains(string(bETDec), `"remainingHours":6`) {
+		t.Fatalf("extra-time decision failed: %d %s", rETDec.StatusCode, string(bETDec))
+	}
+
+	// Complete task with qualityScore + result-note
+	rDone, bDone := env.do("PATCH", "/api/v1/tasks/"+taskID+"/status", mgrTok, nil, map[string]any{
+		"status": "selesai", "actualHours": 5.5, "qualityScore": 92,
+	})
+	if rDone.StatusCode != http.StatusOK || !strings.Contains(string(bDone), `"completedAt":"2026-10-01"`) || !strings.Contains(string(bDone), `"qualityScore":92`) {
+		t.Fatalf("complete with qualityScore failed: %d %s", rDone.StatusCode, string(bDone))
+	}
+	rNote, bNote := env.do("PATCH", "/api/v1/tasks/"+taskID+"/result-note", mgrTok, nil, map[string]any{"note": "Dokumentasi dan pengujian webhook sangat lengkap."})
+	if rNote.StatusCode != http.StatusOK || !strings.Contains(string(bNote), `"Dokumentasi dan pengujian webhook sangat lengkap."`) {
+		t.Fatalf("result-note failed: %d %s", rNote.StatusCode, string(bNote))
+	}
+
+	// Freelancer reject + change-request workflow
+	rTFl, bTFl := env.do("POST", "/api/v1/tasks", mgrTok, nil, map[string]any{
+		"projectId":   "klinik",
+		"title":       "Optimasi Query Dashboard Klinik",
+		"description": "Optimasi indeks PostgreSQL dan query laporan harian klinik.",
+		"dueDate":     "2026-10-02",
+	})
+	var flTask struct{ Task struct{ ID string `json:"id"` } `json:"task"` }
+	_ = json.Unmarshal(bTFl, &flTask)
+	if rTFl.StatusCode != http.StatusCreated {
+		t.Fatalf("create freelancer task failed: %d", rTFl.StatusCode)
+	}
+	rConfFl, bConfFl := env.do("PUT", "/api/v1/tasks/"+flTask.Task.ID+"/confirm-dna", mgrTok, nil, map[string]any{
+		"requirements": []map[string]any{{"competencyId": "sql", "level": 1, "p": 1.0, "quote": "query postgres"}},
+		"complexity": 2, "effortHours": 4, "effortSize": "S", "dependencies": []any{},
+	})
+	if rConfFl.StatusCode != http.StatusOK {
+		t.Fatalf("confirm freelancer DNA failed: %d %s", rConfFl.StatusCode, string(bConfFl))
+	}
+	rAsgFl, bAsgFl := env.do("POST", "/api/v1/tasks/"+flTask.Task.ID+"/assign", mgrTok, nil, map[string]any{
+		"assignments": []map[string]any{{"memberId": flInv.Member.ID, "hours": 4}},
+		"preset": "seimbang", "reasonCode": "lainnya", "note": "Penugasan langsung ke freelancer SQL.",
+	})
+	if rAsgFl.StatusCode != http.StatusOK {
+		t.Fatalf("assign freelancer task failed: %d %s", rAsgFl.StatusCode, string(bAsgFl))
+	}
+	// Freelancer change-request creates Task.ChangeRequest & HrRequest, then manager reviews it
+	rChg, bChg := env.do("POST", "/api/v1/saya/tasks/"+flTask.Task.ID+"/change-request", dinaTok, nil, map[string]any{
+		"reason": "Kontrak minggu ini penuh sehingga butuh penyesuaian tenggat atau bantuan.",
+	})
+	if rChg.StatusCode != http.StatusOK || !strings.Contains(string(bChg), `"status":"pending"`) {
+		t.Fatalf("freelancer change-request failed: %d %s", rChg.StatusCode, string(bChg))
+	}
+	rChgRev, bChgRev := env.do("POST", "/api/v1/tasks/"+flTask.Task.ID+"/change-request/review", mgrTok, nil, nil)
+	if rChgRev.StatusCode != http.StatusOK || !strings.Contains(string(bChgRev), `"status":"reviewed"`) {
+		t.Fatalf("review change-request failed: %d %s", rChgRev.StatusCode, string(bChgRev))
+	}
+	// Freelancer can also reject waiting assignment with reason >= 10 chars
+	rFlRej, _ := env.do("POST", "/api/v1/saya/tasks/"+flTask.Task.ID+"/respond", dinaTok, nil, map[string]any{
+		"accept": false, "reason": "Bentrok jadwal kontrak dengan klien lain di tanggal yang sama.",
+	})
+	if rFlRej.StatusCode != http.StatusOK {
+		t.Fatalf("freelancer reject expected 200, got %d", rFlRej.StatusCode)
+	}
+
+	// 3. CSV Tasks Import (dryRun & commit, incl. external task)
+	taskCSV := strings.Join([]string{
+		"judul,proyek,tenggat,jam_tenggat,prioritas,dikelola_di,penanggung_jawab,jam,deskripsi",
+		"Audit Keamanan Endpoint,klinik,2026-10-02,16:00,tinggi,,,,Lakukan audit OWASP API Top 10 seluruh endpoint klinik sebelum rilis.",
+		"Sinkronisasi Board Trello,koperasi,2026-10-02,,normal,Trello Koperasi,bima@pantara.id,3,Koordinasi backlog rilis di Trello",
+	}, "\n")
+	rDryT, bDryT := env.do("POST", "/api/v1/tasks/import", mgrTok, nil, map[string]any{"csv": taskCSV, "dryRun": true})
+	if rDryT.StatusCode != http.StatusOK || strings.Contains(string(bDryT), `"error"`) {
+		t.Fatalf("task import dryRun failed: %d %s", rDryT.StatusCode, string(bDryT))
+	}
+	rImpT, bImpT := env.do("POST", "/api/v1/tasks/import", mgrTok, nil, map[string]any{"csv": taskCSV, "dryRun": false})
+	if rImpT.StatusCode != http.StatusOK || !strings.Contains(string(bImpT), `"externalSource":"Trello Koperasi"`) {
+		t.Fatalf("task import commit failed: %d %s", rImpT.StatusCode, string(bImpT))
+	}
+
+	// 4. Manager reserveRatio update + validation
+	rResBad, _ := env.do("PATCH", "/api/v1/workspace/settings", mgrTok, nil, map[string]any{
+		"preset": "seimbang", "levelTolerance": 1, "overloadAt": 0.9, "reserveRatio": 0.5,
+	})
+	if rResBad.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for reserveRatio>0.3, got %d", rResBad.StatusCode)
+	}
+	rResOK, _ := env.do("PATCH", "/api/v1/workspace/settings", mgrTok, nil, map[string]any{
+		"preset": "seimbang", "levelTolerance": 1, "overloadAt": 0.9, "reserveRatio": 0.2,
+	})
+	if rResOK.StatusCode != http.StatusOK {
+		t.Fatalf("reserveRatio 0.2 update failed: %d", rResOK.StatusCode)
+	}
+
+	// 5. Parallel Leave Request (Employee submits -> Manager approves -> HR approves -> leaveDates updated)
+	rLeaveSub, bLeaveSub := env.do("POST", "/api/v1/saya/leave-requests", bimaTok, nil, map[string]any{
+		"start": "2026-10-05", "end": "2026-10-06", "type": "tahunan", "reason": "Menghadiri acara wisuda keluarga di Bandung.",
+	})
+	if rLeaveSub.StatusCode != http.StatusCreated {
+		t.Fatalf("create leave request failed: %d %s", rLeaveSub.StatusCode, string(bLeaveSub))
+	}
+	var leaveMem struct {
+		Member struct {
+			LeaveRequests []struct {
+				ID string `json:"id"`
+			} `json:"leaveRequests"`
+		} `json:"member"`
+	}
+	_ = json.Unmarshal(bLeaveSub, &leaveMem)
+	reqID := leaveMem.Member.LeaveRequests[0].ID
+
+	rMgrLeave, bMgrLeave := env.do("POST", "/api/v1/members/bima/leave-requests/"+reqID+"/decision", mgrTok, nil, map[string]any{"approve": true})
+	var mgrLeaveRes struct {
+		Member struct {
+			LeaveDates []string `json:"leaveDates"`
+		} `json:"member"`
+	}
+	_ = json.Unmarshal(bMgrLeave, &mgrLeaveRes)
+	if rMgrLeave.StatusCode != http.StatusOK || len(mgrLeaveRes.Member.LeaveDates) != 0 {
+		t.Fatalf("manager leave approve should wait for HR before updating leaveDates: %d %s", rMgrLeave.StatusCode, string(bMgrLeave))
+	}
+	rMgrLeaveDup, _ := env.do("POST", "/api/v1/members/bima/leave-requests/"+reqID+"/decision", mgrTok, nil, map[string]any{"approve": true})
+	if rMgrLeaveDup.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 on duplicate manager leave decision, got %d", rMgrLeaveDup.StatusCode)
+	}
+	rHRLeave, bHRLeave := env.do("POST", "/api/v1/hr/leave-requests/"+reqID+"/decision", hrTok, nil, map[string]any{"approve": true})
+	var hrLeaveRes struct {
+		Member struct {
+			LeaveDates []string `json:"leaveDates"`
+		} `json:"member"`
+	}
+	_ = json.Unmarshal(bHRLeave, &hrLeaveRes)
+	if rHRLeave.StatusCode != http.StatusOK || len(hrLeaveRes.Member.LeaveDates) != 2 {
+		t.Fatalf("HR second approval should populate 2 workdays into leaveDates: %d %s", rHRLeave.StatusCode, string(bHRLeave))
+	}
+
+	// 6. HR Console: divisions, placement, member import, HR overrides + manager ignores weeklyLimit, HR settings, inbox requests
+	rDivC, _ := env.do("POST", "/api/v1/hr/divisions", hrTok, nil, map[string]any{"name": "Produk"})
+	if rDivC.StatusCode != http.StatusCreated {
+		t.Fatalf("create division failed: %d", rDivC.StatusCode)
+	}
+	rPlace, bPlace := env.do("POST", "/api/v1/hr/members/place", hrTok, nil, map[string]any{
+		"ids": []string{"bima"}, "division": "Produk", "team": "Core API",
+	})
+	if rPlace.StatusCode != http.StatusOK || !strings.Contains(string(bPlace), `"division":"Produk"`) {
+		t.Fatalf("place members failed: %d %s", rPlace.StatusCode, string(bPlace))
+	}
+	rDivRen, bDivRen := env.do("PATCH", "/api/v1/hr/divisions/Produk", hrTok, nil, map[string]any{"name": "Product & Tech"})
+	var divRenRes struct {
+		Division string `json:"division"`
+	}
+	_ = json.Unmarshal(bDivRen, &divRenRes)
+	if rDivRen.StatusCode != http.StatusOK || divRenRes.Division != "Product & Tech" {
+		t.Fatalf("rename division failed: %d %s", rDivRen.StatusCode, string(bDivRen))
+	}
+
+	memCSV := "nama,email,jabatan,jenis,tim,divisi,jam\nSari Wulandari,sari@pantara.id,UI Designer,freelancer,Design System,Product & Tech,25\n"
+	rImpM, bImpM := env.do("POST", "/api/v1/members/import", hrTok, nil, map[string]any{"csv": memCSV, "dryRun": false})
+	if rImpM.StatusCode != http.StatusOK || !strings.Contains(string(bImpM), `"employmentType":"freelancer"`) {
+		t.Fatalf("member import failed: %d %s", rImpM.StatusCode, string(bImpM))
+	}
+
+	// Manager cannot change weeklyLimit via PATCH /members/:id; HR sets and clears override cleanly
+	_, _ = env.do("PATCH", "/api/v1/members/bima", mgrTok, nil, map[string]any{"name": "Bima Pradana", "weeklyLimit": 12})
+	rHROv, bHROv := env.do("PATCH", "/api/v1/members/bima", hrTok, nil, map[string]any{
+		"workHoursOverride": 32, "reserveHoursOverride": 4,
+	})
+	if rHROv.StatusCode != http.StatusOK || !strings.Contains(string(bHROv), `"weeklyLimit":36`) || !strings.Contains(string(bHROv), `"workHoursOverride":32`) {
+		t.Fatalf("HR override or manager weeklyLimit-ignore check failed: %d %s", rHROv.StatusCode, string(bHROv))
+	}
+	rHRClear, bHRClear := env.do("PATCH", "/api/v1/members/bima", hrTok, nil, map[string]any{"workHoursOverride": nil})
+	if rHRClear.StatusCode != http.StatusOK || strings.Contains(string(bHRClear), `"workHoursOverride"`) {
+		t.Fatalf("expected workHoursOverride null to clear field: %d %s", rHRClear.StatusCode, string(bHRClear))
+	}
+
+	rHRS, _ := env.do("PUT", "/api/v1/hr/settings", hrTok, nil, map[string]any{"weeklyHours": 40, "reserveHours": 4})
+	if rHRS.StatusCode != http.StatusOK {
+		t.Fatalf("PUT /hr/settings failed: %d", rHRS.StatusCode)
+	}
+	rHRReqC, bHRReqC := env.do("POST", "/api/v1/hr/requests", bimaTok, nil, map[string]any{
+		"title": "Butuh monitor tambahan", "description": "Layar tambahan untuk pengerjaan modul dashboard.",
+	})
+	if rHRReqC.StatusCode != http.StatusCreated {
+		t.Fatalf("create HR request failed: %d %s", rHRReqC.StatusCode, string(bHRReqC))
+	}
+	var hrReqResp struct{ Request struct{ ID string `json:"id"` } `json:"request"` }
+	_ = json.Unmarshal(bHRReqC, &hrReqResp)
+	_, _ = env.do("POST", "/api/v1/hr/requests/"+hrReqResp.Request.ID+"/read", hrTok, nil, nil)
+	rHRHnd, bHRHnd := env.do("POST", "/api/v1/hr/requests/"+hrReqResp.Request.ID+"/handle", hrTok, nil, nil)
+	if rHRHnd.StatusCode != http.StatusOK || !strings.Contains(string(bHRHnd), `"handled":true`) {
+		t.Fatalf("handle HR request failed: %d %s", rHRHnd.StatusCode, string(bHRHnd))
+	}
+
+	// 7. Performance Config (HR) & Monthly Performance Review (Manager) + 409 Duplicate Check
+	rPC, _ := env.do("PUT", "/api/v1/hr/performance-config", hrTok, nil, map[string]any{
+		"automaticWeight": 40,
+		"criteria": []map[string]any{
+			{"id": "collaboration", "name": "Kolaborasi", "weight": 60, "active": true},
+			{"id": "responsibility", "name": "Tanggung jawab", "weight": 40, "active": true},
+		},
+	})
+	if rPC.StatusCode != http.StatusOK {
+		t.Fatalf("PUT /hr/performance-config failed: %d", rPC.StatusCode)
+	}
+	rRev, bRev := env.do("POST", "/api/v1/manager/performance-reviews", mgrTok, nil, map[string]any{
+		"memberId": "bima",
+		"period":   "2026-10",
+		"note":     "Eksekusi webhook tepat waktu dan kualitas solid.",
+		"criteria": []map[string]any{
+			{"id": "collaboration", "score": 88},
+			{"id": "responsibility", "score": 92},
+		},
+	})
+	if rRev.StatusCode != http.StatusCreated || !strings.Contains(string(bRev), `"onTimeScore":100`) || !strings.Contains(string(bRev), `"qualityScore":92`) {
+		t.Fatalf("create performance review failed: %d %s", rRev.StatusCode, string(bRev))
+	}
+	rRevDup, _ := env.do("POST", "/api/v1/manager/performance-reviews", mgrTok, nil, map[string]any{
+		"memberId": "bima",
+		"period":   "2026-10",
+		"note":     "Duplikat periode yang sama.",
+		"criteria": []map[string]any{
+			{"id": "collaboration", "score": 80},
+			{"id": "responsibility", "score": 80},
+		},
+	})
+	if rRevDup.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 on duplicate monthly performance review, got %d", rRevDup.StatusCode)
+	}
+	rRevList, bRevList := env.do("GET", "/api/v1/hr/performance-reviews?period=2026-10&memberId=bima", hrTok, nil, nil)
+	if rRevList.StatusCode != http.StatusOK || !strings.Contains(string(bRevList), `"memberId":"bima"`) {
+		t.Fatalf("GET /hr/performance-reviews failed: %d %s", rRevList.StatusCode, string(bRevList))
+	}
+
+	// Admin check remains reachable
+	rAdmBoot, _ := env.do("GET", "/api/v1/workspace/bootstrap", adminTok, nil, nil)
+	if rAdmBoot.StatusCode != http.StatusOK {
+		t.Fatalf("admin bootstrap failed: %d", rAdmBoot.StatusCode)
 	}
 }

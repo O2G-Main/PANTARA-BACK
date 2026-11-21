@@ -4,6 +4,7 @@ import (
 	"math"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/Orang2-BU/pantara-back/internal/domain/engine"
 	"github.com/Orang2-BU/pantara-back/internal/domain/member"
@@ -147,5 +148,124 @@ func TestReplanRisksAndWeeklyLoad(t *testing.T) {
 	load := engine.WeeklyLoad(members[2], tasks, "2026-09-29", 4)
 	if len(load) != 4 || load[0].Hours != 4 {
 		t.Fatalf("unexpected weekly load: %+v", load)
+	}
+}
+
+func TestExtraTimeLifecycle(t *testing.T) {
+	due := makeTask("T1", "2026-10-02", 6, []task.Assignment{{MemberID: "m", Hours: 8}, {MemberID: "x", Hours: 4}})
+	due.DueTime = "15:00"
+
+	dl, err := engine.DeadlineAt(due.DueDate, due.DueTime)
+	if err != nil || dl.UTC().Format(time.RFC3339) != "2026-10-02T08:00:00Z" {
+		t.Fatalf("unexpected deadlineAt: %v %v", dl, err)
+	}
+	dlDefault, err := engine.DeadlineAt("2026-10-02", "")
+	if err != nil || dlDefault.UTC().Format(time.RFC3339) != "2026-10-02T10:00:00Z" {
+		t.Fatalf("unexpected default deadlineAt: %v %v", dlDefault, err)
+	}
+
+	tEarly, _ := time.Parse(time.RFC3339, "2026-10-02T12:59:00+07:00")
+	tExact, _ := time.Parse(time.RFC3339, "2026-10-02T13:00:00+07:00")
+	tLate, _ := time.Parse(time.RFC3339, "2026-10-02T16:00:00+07:00")
+
+	if engine.CanRequestExtraTime(due, tEarly) {
+		t.Fatalf("expected CanRequestExtraTime false 2h01m before deadline")
+	}
+	if !engine.CanRequestExtraTime(due, tExact) || !engine.CanRequestExtraTime(due, tLate) {
+		t.Fatalf("expected CanRequestExtraTime true within <=2h window")
+	}
+
+	pending := due
+	pending.ExtraTime = &task.ExtraTimeRequest{MemberID: "m", Hours: 3, Reason: "Perlu tambahan skenario uji.", Status: task.ExtraTimePending}
+	if engine.CanRequestExtraTime(pending, tExact) {
+		t.Fatalf("must block when request is already pending")
+	}
+
+	okTask, ok := engine.DecideExtraTime(pending, true)
+	if !ok || okTask.RemainingHours != 9 || okTask.Assignments[0].Hours != 11 || okTask.Assignments[1].Hours != 4 || okTask.ExtraTime.Status != task.ExtraTimeApproved {
+		t.Fatalf("unexpected approve result: ok=%v task=%+v", ok, okTask)
+	}
+	rejTask, ok := engine.DecideExtraTime(pending, false)
+	if !ok || rejTask.RemainingHours != 6 || rejTask.ExtraTime.Status != task.ExtraTimeRejected {
+		t.Fatalf("unexpected reject result: ok=%v task=%+v", ok, rejTask)
+	}
+	if _, ok := engine.DecideExtraTime(okTask, false); ok {
+		t.Fatalf("decided request must not be decided again")
+	}
+}
+
+func TestLeaveValidationAndParallelApproval(t *testing.T) {
+	today := "2026-09-29"
+	if msg := engine.ValidateLeaveRequest("", "2026-10-01", "Acara keluarga besar", today); msg == "" {
+		t.Fatalf("expected error on missing start date")
+	}
+	if msg := engine.ValidateLeaveRequest("2026-09-28", "2026-10-01", "Acara keluarga besar", today); msg == "" {
+		t.Fatalf("expected error when start < today")
+	}
+	if msg := engine.ValidateLeaveRequest("2026-10-02", "2026-10-01", "Acara keluarga besar", today); msg == "" {
+		t.Fatalf("expected error when end < start")
+	}
+	if msg := engine.ValidateLeaveRequest("2026-10-03", "2026-10-04", "Acara keluarga besar", today); msg == "" {
+		t.Fatalf("expected error on weekend-only leave")
+	}
+	if msg := engine.ValidateLeaveRequest("2026-10-01", "2026-10-02", "Sakit", today); msg == "" {
+		t.Fatalf("expected error on short reason")
+	}
+	if msg := engine.ValidateLeaveRequest("2026-10-01", "2026-10-02", "Acara keluarga di luar kota", today); msg != "" {
+		t.Fatalf("unexpected validation error: %s", msg)
+	}
+
+	req := member.LeaveRequest{
+		ID:      "c1",
+		Start:   "2026-10-01",
+		End:     "2026-10-05",
+		Type:    member.LeaveAnnual,
+		Reason:  "Acara keluarga di luar kota",
+		Manager: member.ApprovalPending,
+		HR:      member.ApprovalPending,
+	}
+	m := makeMember(floatPtr(32), []string{"2026-09-30"})
+	m.LeaveRequests = []member.LeaveRequest{req}
+
+	mMgr, _, ok := engine.DecideLeave(m, "c1", "manager", true)
+	if !ok || len(mMgr.LeaveDates) != 1 {
+		t.Fatalf("manager-only approval must not modify LeaveDates yet")
+	}
+	mBoth, _, ok := engine.DecideLeave(mMgr, "c1", "hr", true)
+	if !ok {
+		t.Fatalf("expected second HR approval to succeed")
+	}
+	wantDates := []string{"2026-09-30", "2026-10-01", "2026-10-02", "2026-10-05"}
+	if !reflect.DeepEqual(mBoth.LeaveDates, wantDates) {
+		t.Fatalf("expected merged leaveDates %v, got %v", wantDates, mBoth.LeaveDates)
+	}
+
+	mRej, _, ok := engine.DecideLeave(m, "c1", "manager", false)
+	if !ok || mRej.LeaveRequests[0].CombinedStatus() != member.ApprovalRejected {
+		t.Fatalf("expected combined rejected status")
+	}
+	if _, _, ok := engine.DecideLeave(mRej, "c1", "hr", true); ok {
+		t.Fatalf("rejected leave request must not allow further approval")
+	}
+}
+
+func TestAutomaticPerformance(t *testing.T) {
+	q80 := 80.0
+	q60 := 60.0
+	tasks := []task.Task{
+		{ID: "1", DueDate: "2026-09-20", Status: task.StatusDone, CompletedAt: "2026-09-20", QualityScore: &q80, Assignments: []task.Assignment{{MemberID: "a", Hours: 4}}},
+		{ID: "2", DueDate: "2026-09-20", Status: task.StatusDone, CompletedAt: "2026-09-21", QualityScore: &q60, Assignments: []task.Assignment{{MemberID: "a", Hours: 4}}},
+		{ID: "3", DueDate: "2026-10-01", Status: task.StatusDone, CompletedAt: "2026-10-01", QualityScore: &q80, Assignments: []task.Assignment{{MemberID: "a", Hours: 4}}},
+	}
+	ot, qual, sc := engine.AutomaticPerformance(tasks, "a", "2026-09")
+	if ot == nil || qual == nil || sc == nil || *ot != 50 || *qual != 70 || *sc != 60 {
+		t.Fatalf("unexpected automatic performance: ot=%v qual=%v sc=%v", ot, qual, sc)
+	}
+	tasksMissingQual := []task.Task{
+		{ID: "1", DueDate: "2026-09-20", Status: task.StatusDone, CompletedAt: "2026-09-20", QualityScore: nil, Assignments: []task.Assignment{{MemberID: "a", Hours: 4}}},
+	}
+	ot2, qual2, sc2 := engine.AutomaticPerformance(tasksMissingQual, "a", "2026-09")
+	if ot2 == nil || qual2 != nil || sc2 != nil {
+		t.Fatalf("expected nil quality/score when quality missing, got ot=%v qual=%v sc=%v", ot2, qual2, sc2)
 	}
 }

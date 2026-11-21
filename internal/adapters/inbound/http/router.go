@@ -21,6 +21,7 @@ type RouterDeps struct {
 	TaskUC             *usecase.TaskUseCase
 	SelfUC             *usecase.SelfUseCase
 	ReportNotifUC      *usecase.ReportAndNotifUseCase
+	HRUC               *usecase.HRUseCase
 	Security           port.SecurityStore
 	HealthCheck        func(ctx context.Context) error
 	CORSAllowedOrigins []string
@@ -72,6 +73,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 	th := &taskHandlers{uc: deps.TaskUC}
 	sh := &selfHandlers{uc: deps.SelfUC}
 	nh := &analyticsHandlers{uc: deps.ReportNotifUC}
+	hh := &hrHandlers{uc: deps.HRUC}
 
 	r.Route("/api/v1", func(api chi.Router) {
 		// Public auth endpoints (tight brute-force rate limit on login/register/forgot-password)
@@ -110,12 +112,30 @@ func NewRouter(deps RouterDeps) http.Handler {
 			authed.Post("/notifications/{id}/read", nh.markNotificationRead)
 			authed.Get("/notifications/stream", nh.streamNotifications)
 
-			// Employee Self-Service (/saya)
+			// Employee Self-Service (/saya) & shared HR request submission
 			authed.Get("/saya/overview", sh.overview)
 			authed.Patch("/saya/profile", sh.updateProfile)
 			authed.Put("/saya/availability", sh.updateAvailability)
 			authed.Post("/saya/tasks/{id}/respond", sh.respondTask)
 			authed.Patch("/saya/tasks/{id}/progress", sh.updateProgress)
+			authed.Post("/saya/tasks/{id}/extra-time", sh.requestExtraTime)
+			authed.Post("/saya/tasks/{id}/change-request", sh.requestTaskChange)
+			authed.Post("/saya/leave-requests", sh.createLeaveRequest)
+			authed.Post("/hr/requests", hh.createRequest)
+
+			// Shared Manager + HR + Admin operations
+			authed.Group(func(mhr chi.Router) {
+				mhr.Use(requireManagerOrHR)
+
+				mhr.Get("/members", ch.listMembers)
+				mhr.Get("/members/{id}", ch.getMember)
+				mhr.Post("/members", ch.createMember)
+				mhr.Post("/members/{id}/invite-resend", ch.resendInvite)
+				mhr.Patch("/members/{id}", ch.updateMember)
+				mhr.Get("/tasks", th.list)
+				mhr.Get("/hr/performance-config", hh.getPerformanceConfig)
+				mhr.Get("/hr/performance-reviews", hh.listPerformanceReviews)
+			})
 
 			// Manager + Admin routes
 			authed.Group(func(mgr chi.Router) {
@@ -131,19 +151,18 @@ func NewRouter(deps RouterDeps) http.Handler {
 				mgr.Patch("/projects/{id}", ch.updateProject)
 				mgr.Delete("/projects/{id}", ch.deleteProject)
 
-				// Team & Member operations
-				mgr.Get("/members", ch.listMembers)
-				mgr.Get("/members/{id}", ch.getMember)
-				mgr.Post("/members", ch.createMember)
-				mgr.Post("/members/{id}/invite-resend", ch.resendInvite)
-				mgr.Patch("/members/{id}", ch.updateMember)
-				mgr.Put("/members/{id}/availability", ch.updateMemberAvailability)
+				// Engine weights & reserveRatio settings (Manager adjusts reserveRatio on /kapasitas)
+				mgr.Get("/workspace/settings", wh.getSettings)
+				mgr.Patch("/workspace/settings", wh.updateSettings)
+
+				// Manager-specific member actions & parallel leave decisions
 				mgr.Post("/members/{id}/competencies/{compId}/verify", ch.verifyCompetency)
 				mgr.Post("/members/{id}/remind", ch.remindMember)
+				mgr.Post("/members/{id}/leave-requests/{reqId}/decision", ch.decideLeaveByManager)
 
-				// Tasks, AI Task DNA, Recommendation, Simulation, Assignment & Batch
-				mgr.Get("/tasks", th.list)
+				// Tasks, CSV import, AI Task DNA, Recommendation, Simulation, Assignment, Extra Time & Batch
 				mgr.Post("/tasks", th.create)
+				mgr.Post("/tasks/import", th.importCSV)
 				mgr.Patch("/tasks/{id}", th.update)
 				mgr.Delete("/tasks/{id}", th.deleteOrArchive)
 				mgr.Post("/tasks/{id}/flow-start", th.flowStart)
@@ -155,8 +174,14 @@ func NewRouter(deps RouterDeps) http.Handler {
 				mgr.Post("/tasks/{id}/reject", th.reject)
 				mgr.Post("/tasks/{id}/unassign", th.unassign)
 				mgr.Patch("/tasks/{id}/status", th.updateStatus)
+				mgr.Post("/tasks/{id}/extra-time/decision", th.decideExtraTime)
+				mgr.Patch("/tasks/{id}/result-note", th.updateResultNote)
+				mgr.Post("/tasks/{id}/change-request/review", th.reviewChangeRequest)
 				mgr.Get("/batch/preview", th.batchPreview)
 				mgr.Post("/batch/commit", th.batchCommit)
+
+				// Manager monthly performance evaluation
+				mgr.Post("/manager/performance-reviews", hh.createPerformanceReview)
 
 				// Analytics & Decision Log
 				mgr.Get("/decisions", nh.listDecisions)
@@ -167,7 +192,27 @@ func NewRouter(deps RouterDeps) http.Handler {
 				mgr.Get("/relation-graph", nh.relationGraph)
 			})
 
-			// Admin-only routes (organization settings, onboarding, work periods, engine weights, member access/active, billing)
+			// HR + Admin routes
+			authed.Group(func(hrOnly chi.Router) {
+				hrOnly.Use(requireHR)
+
+				hrOnly.Put("/members/{id}/availability", ch.updateMemberAvailability)
+				hrOnly.Post("/members/import", ch.importMembers)
+				hrOnly.Get("/hr/divisions", hh.listDivisions)
+				hrOnly.Post("/hr/divisions", hh.createDivision)
+				hrOnly.Patch("/hr/divisions/{name}", hh.renameDivision)
+				hrOnly.Post("/hr/members/place", hh.placeMembers)
+				hrOnly.Get("/hr/settings", hh.getSettings)
+				hrOnly.Put("/hr/settings", hh.updateSettings)
+				hrOnly.Put("/hr/performance-config", hh.updatePerformanceConfig)
+				hrOnly.Get("/hr/requests", hh.listRequests)
+				hrOnly.Post("/hr/requests/{id}/read", hh.markRequestRead)
+				hrOnly.Post("/hr/requests/{id}/handle", hh.handleRequest)
+				hrOnly.Get("/hr/leave-requests", hh.listLeaveRequests)
+				hrOnly.Post("/hr/leave-requests/{reqId}/decision", hh.decideLeave)
+			})
+
+			// Admin-only routes (organization settings, onboarding, work periods, member access/active, billing)
 			authed.Group(func(adm chi.Router) {
 				adm.Use(requireAdmin)
 
@@ -176,8 +221,6 @@ func NewRouter(deps RouterDeps) http.Handler {
 				adm.Post("/workspace/onboarding", wh.completeOnboarding)
 				adm.Post("/workspace/periods", wh.createPeriod)
 				adm.Post("/workspace/periods/{id}/activate", wh.activatePeriod)
-				adm.Get("/workspace/settings", wh.getSettings)
-				adm.Patch("/workspace/settings", wh.updateSettings)
 				adm.Get("/workspace/billing", wh.getBilling)
 				adm.Patch("/members/{id}/access", ch.setMemberAccessAndActive)
 			})

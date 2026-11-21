@@ -58,6 +58,7 @@ func (h *taskHandlers) update(w http.ResponseWriter, r *http.Request) {
 		Title       *string        `json:"title"`
 		Description *string        `json:"description"`
 		DueDate     *string        `json:"dueDate"`
+		DueTime     *string        `json:"dueTime"`
 		Priority    *task.Priority `json:"priority"`
 		Status      *task.Status   `json:"status"`
 	}
@@ -65,7 +66,7 @@ func (h *taskHandlers) update(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
-	t, err := h.uc.UpdateTaskMetadata(r.Context(), claims, id, body.ProjectID, body.Title, body.Description, body.DueDate, body.Priority, body.Status)
+	t, err := h.uc.UpdateTaskMetadata(r.Context(), claims, id, body.ProjectID, body.Title, body.Description, body.DueDate, body.DueTime, body.Priority, body.Status)
 	if err != nil {
 		writeError(w, r, err)
 		return
@@ -207,14 +208,80 @@ func (h *taskHandlers) updateStatus(w http.ResponseWriter, r *http.Request) {
 	claims := mustClaims(r.Context())
 	id := chi.URLParam(r, "id")
 	var body struct {
-		Status      task.Status `json:"status"`
-		ActualHours *float64    `json:"actualHours"`
+		Status       task.Status `json:"status"`
+		ActualHours  *float64    `json:"actualHours"`
+		QualityScore *float64    `json:"qualityScore"`
 	}
 	if err := decodeJSON(w, r, &body); err != nil {
 		writeError(w, r, err)
 		return
 	}
-	t, err := h.uc.UpdateStatus(r.Context(), claims, id, body.Status, body.ActualHours)
+	t, err := h.uc.UpdateStatus(r.Context(), claims, id, body.Status, body.ActualHours, body.QualityScore)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeOK(w, map[string]any{"task": t})
+}
+
+func (h *taskHandlers) decideExtraTime(w http.ResponseWriter, r *http.Request) {
+	claims := mustClaims(r.Context())
+	id := chi.URLParam(r, "id")
+	var body struct {
+		Approve bool `json:"approve"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		writeError(w, r, err)
+		return
+	}
+	t, err := h.uc.DecideExtraTime(r.Context(), claims, id, body.Approve)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeOK(w, map[string]any{"task": t})
+}
+
+func (h *taskHandlers) importCSV(w http.ResponseWriter, r *http.Request) {
+	claims := mustClaims(r.Context())
+	var body struct {
+		CSV    string `json:"csv"`
+		DryRun bool   `json:"dryRun"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		writeError(w, r, err)
+		return
+	}
+	rows, err := h.uc.ImportTasksCSV(r.Context(), claims, body.CSV, body.DryRun)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeOK(w, map[string]any{"rows": rows})
+}
+
+func (h *taskHandlers) updateResultNote(w http.ResponseWriter, r *http.Request) {
+	claims := mustClaims(r.Context())
+	id := chi.URLParam(r, "id")
+	var body struct {
+		Note string `json:"note"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		writeError(w, r, err)
+		return
+	}
+	t, err := h.uc.UpdateResultNote(r.Context(), claims, id, body.Note)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeOK(w, map[string]any{"task": t})
+}
+
+func (h *taskHandlers) reviewChangeRequest(w http.ResponseWriter, r *http.Request) {
+	claims := mustClaims(r.Context())
+	id := chi.URLParam(r, "id")
+	t, err := h.uc.ReviewChangeRequest(r.Context(), claims, id)
 	if err != nil {
 		writeError(w, r, err)
 		return

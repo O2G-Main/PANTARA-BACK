@@ -101,7 +101,7 @@ type DecisionRepo struct{ *Store }
 type NotificationRepo struct{ *Store }
 
 func (r MemberRepo) List(ctx context.Context, orgID, periodID string, includeInactive bool) ([]member.Member, error) {
-	q := `SELECT id, organization_id, user_id, name, initials, role_title, email, weekly_limit, photo_url, access_role, is_active, invite_pending, prefers_json, avoids_json, created_at, updated_at
+	q := `SELECT id, organization_id, user_id, name, initials, role_title, employment_type, team, division, email, weekly_limit, work_hours_override, reserve_hours_override, photo_url, access_role, is_active, invite_pending, prefers_json, avoids_json, leave_requests_json, created_at, updated_at
 		FROM members WHERE organization_id = $1`
 	if !includeInactive {
 		q += ` AND is_active = TRUE`
@@ -117,13 +117,31 @@ func (r MemberRepo) List(ctx context.Context, orgID, periodID string, includeIna
 	indexByID := make(map[string]int)
 	for rows.Next() {
 		var m member.Member
-		var accessStr, prefersRaw, avoidsRaw string
-		if err := rows.Scan(&m.ID, &m.OrganizationID, &m.UserID, &m.Name, &m.Initials, &m.Role, &m.Email, &m.WeeklyLimit, &m.Photo, &accessStr, &m.IsActive, &m.InvitePending, &prefersRaw, &avoidsRaw, &m.CreatedAt, &m.UpdatedAt); err != nil {
+		var empStr, accessStr, prefersRaw, avoidsRaw, leaveReqsRaw string
+		var workOver, resOver sql.NullFloat64
+		if err := rows.Scan(
+			&m.ID, &m.OrganizationID, &m.UserID, &m.Name, &m.Initials, &m.Role, &empStr, &m.Team, &m.Division,
+			&m.Email, &m.WeeklyLimit, &workOver, &resOver, &m.Photo, &accessStr, &m.IsActive, &m.InvitePending,
+			&prefersRaw, &avoidsRaw, &leaveReqsRaw, &m.CreatedAt, &m.UpdatedAt,
+		); err != nil {
 			return nil, err
+		}
+		m.EmploymentType = member.EmploymentType(empStr)
+		if m.EmploymentType == "" {
+			m.EmploymentType = member.EmploymentEmployee
+		}
+		if workOver.Valid {
+			v := workOver.Float64
+			m.WorkHoursOverride = &v
+		}
+		if resOver.Valid {
+			v := resOver.Float64
+			m.ReserveHoursOverride = &v
 		}
 		m.Access = auth.Role(accessStr)
 		_ = json.Unmarshal([]byte(prefersRaw), &m.Prefers)
 		_ = json.Unmarshal([]byte(avoidsRaw), &m.Avoids)
+		_ = json.Unmarshal([]byte(leaveReqsRaw), &m.LeaveRequests)
 		if m.Prefers == nil {
 			m.Prefers = []string{}
 		}
@@ -253,15 +271,35 @@ func (r MemberRepo) GetAvailability(ctx context.Context, memberID, periodID stri
 	return &snap, nil
 }
 
+func marshalMemberExtras(m member.Member) (empType string, workOver, resOver sql.NullFloat64, prefersRaw, avoidsRaw, leaveReqsRaw string) {
+	empType = string(m.EmploymentType)
+	if empType == "" {
+		empType = string(member.EmploymentEmployee)
+	}
+	if m.WorkHoursOverride != nil {
+		workOver = sql.NullFloat64{Float64: *m.WorkHoursOverride, Valid: true}
+	}
+	if m.ReserveHoursOverride != nil {
+		resOver = sql.NullFloat64{Float64: *m.ReserveHoursOverride, Valid: true}
+	}
+	b1, _ := json.Marshal(m.Prefers)
+	b2, _ := json.Marshal(m.Avoids)
+	reqs := m.LeaveRequests
+	if reqs == nil {
+		reqs = []member.LeaveRequest{}
+	}
+	b3, _ := json.Marshal(reqs)
+	return empType, workOver, resOver, string(b1), string(b2), string(b3)
+}
+
 func (r MemberRepo) Create(ctx context.Context, orgID, periodID string, m member.Member) error {
-	prefersRaw, _ := json.Marshal(m.Prefers)
-	avoidsRaw, _ := json.Marshal(m.Avoids)
+	empType, workOver, resOver, prefersRaw, avoidsRaw, leaveReqsRaw := marshalMemberExtras(m)
 	now := time.Now().UTC()
 	ex := r.exec(ctx)
 	if _, err := ex.ExecContext(ctx, r.q(`
-		INSERT INTO members (organization_id, id, user_id, name, initials, role_title, email, weekly_limit, photo_url, access_role, is_active, invite_pending, prefers_json, avoids_json, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-	`), orgID, m.ID, m.UserID, m.Name, m.Initials, m.Role, m.Email, m.WeeklyLimit, m.Photo, string(m.Access), m.IsActive, m.InvitePending, string(prefersRaw), string(avoidsRaw), now, now); err != nil {
+		INSERT INTO members (organization_id, id, user_id, name, initials, role_title, employment_type, team, division, email, weekly_limit, work_hours_override, reserve_hours_override, photo_url, access_role, is_active, invite_pending, prefers_json, avoids_json, leave_requests_json, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+	`), orgID, m.ID, m.UserID, m.Name, m.Initials, m.Role, empType, m.Team, m.Division, m.Email, m.WeeklyLimit, workOver, resOver, m.Photo, string(m.Access), m.IsActive, m.InvitePending, prefersRaw, avoidsRaw, leaveReqsRaw, now, now); err != nil {
 		return errs.Conflict(fmt.Sprintf("Gagal menambahkan karyawan (%s).", m.Email))
 	}
 
@@ -285,12 +323,11 @@ func (r MemberRepo) Create(ctx context.Context, orgID, periodID string, m member
 func (r MemberRepo) UpdateProfile(ctx context.Context, orgID string, m member.Member) error {
 	return r.WithinTx(ctx, func(txCtx context.Context) error {
 		ex := r.exec(txCtx)
-		prefersRaw, _ := json.Marshal(m.Prefers)
-		avoidsRaw, _ := json.Marshal(m.Avoids)
+		empType, workOver, resOver, prefersRaw, avoidsRaw, leaveReqsRaw := marshalMemberExtras(m)
 		res, err := ex.ExecContext(txCtx, r.q(`
-			UPDATE members SET name = $1, initials = $2, role_title = $3, email = $4, weekly_limit = $5, photo_url = $6, prefers_json = $7, avoids_json = $8, updated_at = $9
-			WHERE organization_id = $10 AND id = $11
-		`), m.Name, m.Initials, m.Role, m.Email, m.WeeklyLimit, m.Photo, string(prefersRaw), string(avoidsRaw), time.Now().UTC(), orgID, m.ID)
+			UPDATE members SET name = $1, initials = $2, role_title = $3, employment_type = $4, team = $5, division = $6, email = $7, weekly_limit = $8, work_hours_override = $9, reserve_hours_override = $10, photo_url = $11, is_active = $12, prefers_json = $13, avoids_json = $14, leave_requests_json = $15, updated_at = $16
+			WHERE organization_id = $17 AND id = $18
+		`), m.Name, m.Initials, m.Role, empType, m.Team, m.Division, m.Email, m.WeeklyLimit, workOver, resOver, m.Photo, m.IsActive, prefersRaw, avoidsRaw, leaveReqsRaw, time.Now().UTC(), orgID, m.ID)
 		if err != nil {
 			return err
 		}

@@ -3,6 +3,8 @@ package usecase
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -104,12 +106,26 @@ func (uc *TaskUseCase) GetTask(ctx context.Context, claims auth.Claims, taskID s
 	return t, decs, nil
 }
 
+var dueTimeRe = regexp.MustCompile(`^([01]\d|2[0-3]):[0-5]\d$`)
+
+func normalizeDueTime(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "17:00", nil
+	}
+	if !dueTimeRe.MatchString(trimmed) {
+		return "", errs.Validation("Jam tenggat harus berformat HH:MM (contoh 17:00).")
+	}
+	return trimmed, nil
+}
+
 // CreateTaskInput contains manager inputs when creating a task (P11).
 type CreateTaskInput struct {
 	ProjectID   string        `json:"projectId"`
 	Title       string        `json:"title"`
 	Description string        `json:"description"`
 	DueDate     string        `json:"dueDate"`
+	DueTime     string        `json:"dueTime"`
 	Priority    task.Priority `json:"priority"`
 	Draft       bool          `json:"draft"`
 }
@@ -128,6 +144,10 @@ func (uc *TaskUseCase) CreateTask(ctx context.Context, claims auth.Claims, in Cr
 	}
 	if in.DueDate < uc.todayString() {
 		return task.Task{}, errs.Validation("Tenggat sudah lewat. Pilih hari ini atau sesudahnya.")
+	}
+	dueTime, err := normalizeDueTime(in.DueTime)
+	if err != nil {
+		return task.Task{}, err
 	}
 	if !in.Priority.IsValid() {
 		in.Priority = task.PriorityNormal
@@ -173,6 +193,7 @@ func (uc *TaskUseCase) CreateTask(ctx context.Context, claims auth.Claims, in Cr
 			Title:          title,
 			Description:    desc,
 			DueDate:        in.DueDate,
+			DueTime:        dueTime,
 			Priority:       in.Priority,
 			Status:         status,
 			Assignments:    []task.Assignment{},
@@ -189,7 +210,7 @@ func (uc *TaskUseCase) CreateTask(ctx context.Context, claims auth.Claims, in Cr
 	return created, err
 }
 
-func (uc *TaskUseCase) UpdateTaskMetadata(ctx context.Context, claims auth.Claims, taskID string, projectID, title, description, dueDate *string, priority *task.Priority, status *task.Status) (task.Task, error) {
+func (uc *TaskUseCase) UpdateTaskMetadata(ctx context.Context, claims auth.Claims, taskID string, projectID, title, description, dueDate, dueTime *string, priority *task.Priority, status *task.Status) (task.Task, error) {
 	t, err := uc.tasks.Get(ctx, claims.OrganizationID, taskID)
 	if err != nil {
 		return task.Task{}, err
@@ -212,6 +233,13 @@ func (uc *TaskUseCase) UpdateTaskMetadata(ctx context.Context, claims auth.Claim
 	}
 	if dueDate != nil && *dueDate != "" {
 		t.DueDate = *dueDate
+	}
+	if dueTime != nil {
+		dt, dtErr := normalizeDueTime(*dueTime)
+		if dtErr != nil {
+			return task.Task{}, dtErr
+		}
+		t.DueTime = dt
 	}
 	if priority != nil && priority.IsValid() {
 		t.Priority = *priority
@@ -602,9 +630,12 @@ func (uc *TaskUseCase) Unassign(ctx context.Context, claims auth.Claims, taskID 
 	return updated, err
 }
 
-func (uc *TaskUseCase) UpdateStatus(ctx context.Context, claims auth.Claims, taskID string, status task.Status, actualHours *float64) (task.Task, error) {
+func (uc *TaskUseCase) UpdateStatus(ctx context.Context, claims auth.Claims, taskID string, status task.Status, actualHours, qualityScore *float64) (task.Task, error) {
 	if !status.IsValid() {
 		return task.Task{}, errs.Validation("Status tidak dikenal.")
+	}
+	if qualityScore != nil && (*qualityScore < 0 || *qualityScore > 100) {
+		return task.Task{}, errs.Validation("Nilai kualitas hasil harus antara 0 dan 100.")
 	}
 	var updated task.Task
 	err := uc.tx.WithinTx(ctx, func(txCtx context.Context) error {
@@ -617,6 +648,8 @@ func (uc *TaskUseCase) UpdateStatus(ctx context.Context, claims auth.Claims, tas
 				return errs.Validation("Isi perkiraan jam aktual lebih dari 0.")
 			}
 			t.ActualHours = actualHours
+			t.QualityScore = qualityScore
+			t.CompletedAt = uc.todayString()
 			t.RemainingHours = 0
 		} else if status == task.StatusOpen {
 			t.Assignments = []task.Assignment{}
@@ -630,6 +663,307 @@ func (uc *TaskUseCase) UpdateStatus(ctx context.Context, claims auth.Claims, tas
 		return nil
 	})
 	return updated, err
+}
+
+// DecideExtraTime approves or rejects a pending extra-time request without changing dueDate/dueTime.
+func (uc *TaskUseCase) DecideExtraTime(ctx context.Context, claims auth.Claims, taskID string, approve bool) (task.Task, error) {
+	now := uc.clock.Now().UTC()
+	var updated task.Task
+	var memberNotice *notification.Notice
+
+	err := uc.tx.WithinTx(ctx, func(txCtx context.Context) error {
+		t, err := uc.tasks.GetForUpdate(txCtx, claims.OrganizationID, taskID)
+		if err != nil {
+			return err
+		}
+		next, ok := engine.DecideExtraTime(t, approve)
+		if !ok {
+			return errs.WithCode(errs.KindConflict, "no_pending_request", "Tidak ada permintaan tambahan waktu yang menunggu.")
+		}
+		next.UpdatedAt = now
+		if err := uc.tasks.Update(txCtx, next); err != nil {
+			return err
+		}
+		updated = next
+
+		if u, uErr := uc.auth.GetUserByMemberID(txCtx, claims.OrganizationID, next.ExtraTime.MemberID); uErr == nil {
+			statusWord := "tidak disetujui"
+			if approve {
+				statusWord = fmt.Sprintf("disetujui (+%.1f jam)", next.ExtraTime.Hours)
+			}
+			memberNotice = &notification.Notice{
+				ID:             fmt.Sprintf("waktu-dec-%s-%d", t.ID, now.UnixNano()),
+				OrganizationID: claims.OrganizationID,
+				UserID:         u.ID,
+				Title:          fmt.Sprintf("Tambahan waktu %s: %s", statusWord, t.Title),
+				Subtitle:       claims.Name + " telah meninjau permintaan tambahan waktumu.",
+				Href:           "/saya",
+				Kind:           notification.KindTaskResponse,
+				CreatedAt:      now,
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return task.Task{}, err
+	}
+	if memberNotice != nil {
+		_ = uc.notifs.Upsert(ctx, *memberNotice)
+	}
+	return updated, nil
+}
+
+// UpdateResultNote sets or clears the manager's plain-text result note on a completed task.
+func (uc *TaskUseCase) UpdateResultNote(ctx context.Context, claims auth.Claims, taskID, note string) (task.Task, error) {
+	var updated task.Task
+	err := uc.tx.WithinTx(ctx, func(txCtx context.Context) error {
+		t, err := uc.tasks.GetForUpdate(txCtx, claims.OrganizationID, taskID)
+		if err != nil {
+			return err
+		}
+		if t.Status != task.StatusDone {
+			return errs.Validation("Catatan hasil hanya dapat dicatat untuk tugas yang sudah selesai.")
+		}
+		t.ResultNote = strings.TrimSpace(note)
+		t.UpdatedAt = uc.clock.Now().UTC()
+		if err := uc.tasks.Update(txCtx, t); err != nil {
+			return err
+		}
+		updated = t
+		return nil
+	})
+	return updated, err
+}
+
+// ReviewChangeRequest marks a freelancer's change request on a task as reviewed.
+func (uc *TaskUseCase) ReviewChangeRequest(ctx context.Context, claims auth.Claims, taskID string) (task.Task, error) {
+	var updated task.Task
+	err := uc.tx.WithinTx(ctx, func(txCtx context.Context) error {
+		t, err := uc.tasks.GetForUpdate(txCtx, claims.OrganizationID, taskID)
+		if err != nil {
+			return err
+		}
+		if t.ChangeRequest == nil || t.ChangeRequest.Status != "pending" {
+			return errs.Conflict("Tidak ada permintaan perubahan yang menunggu tinjauan.")
+		}
+		cr := *t.ChangeRequest
+		cr.Status = "reviewed"
+		t.ChangeRequest = &cr
+		t.UpdatedAt = uc.clock.Now().UTC()
+		if err := uc.tasks.Update(txCtx, t); err != nil {
+			return err
+		}
+		updated = t
+		return nil
+	})
+	return updated, err
+}
+
+// ImportTaskRow represents the validation/import outcome for one CSV line.
+type ImportTaskRow struct {
+	Line  int        `json:"line"`
+	Task  *task.Task `json:"task,omitempty"`
+	Error string     `json:"error,omitempty"`
+}
+
+// ImportTasksCSV validates (dryRun=true) or persists (dryRun=false) bulk CSV tasks including external tasks.
+func (uc *TaskUseCase) ImportTasksCSV(ctx context.Context, claims auth.Claims, csvText string, dryRun bool) ([]ImportTaskRow, error) {
+	raw := strings.TrimSpace(csvText)
+	if raw == "" {
+		return nil, errs.Validation("Data CSV tidak boleh kosong.")
+	}
+	rawLines := strings.Split(strings.ReplaceAll(raw, "\r\n", "\n"), "\n")
+	if len(rawLines) == 0 || !strings.HasPrefix(strings.ToLower(strings.TrimSpace(rawLines[0])), "judul,") {
+		return nil, errs.Validation("Baris pertama harus header: judul,proyek,tenggat,jam_tenggat,prioritas,dikelola_di,penanggung_jawab,jam,deskripsi.")
+	}
+
+	period, err := uc.ws.GetActivePeriod(ctx, claims.OrganizationID)
+	if err != nil {
+		return nil, err
+	}
+	projects, err := uc.projects.List(ctx, claims.OrganizationID, false)
+	if err != nil {
+		return nil, err
+	}
+	members, err := uc.members.List(ctx, claims.OrganizationID, period.ID, false)
+	if err != nil {
+		return nil, err
+	}
+	existingTasks, err := uc.tasks.List(ctx, claims.OrganizationID, period.ID, false)
+	if err != nil {
+		return nil, err
+	}
+	catalog, _ := uc.comps.List(ctx, claims.OrganizationID, false)
+
+	projectExists := make(map[string]bool, len(projects))
+	for _, p := range projects {
+		projectExists[p.ID] = true
+	}
+	memberByEmail := make(map[string]member.Member, len(members))
+	for _, m := range members {
+		memberByEmail[strings.ToLower(m.Email)] = m
+	}
+	seen := make(map[string]bool, len(existingTasks))
+	maxNum := 140
+	for _, t := range existingTasks {
+		seen[t.ProjectID+"|"+strings.ToLower(t.Title)] = true
+		if strings.HasPrefix(t.ID, "TGS-") {
+			if n, convErr := strconv.Atoi(strings.TrimPrefix(t.ID, "TGS-")); convErr == nil && n > maxNum {
+				maxNum = n
+			}
+		}
+	}
+
+	today := uc.todayString()
+	now := uc.clock.Now().UTC()
+	nowStr := now.Format(time.RFC3339)
+	previewSeq := maxNum + 1
+
+	rows := make([]ImportTaskRow, 0)
+	var validTasks []task.Task
+	var validIndices []int
+
+	for idx, rawLine := range rawLines[1:] {
+		if strings.TrimSpace(rawLine) == "" {
+			continue
+		}
+		lineNum := idx + 2
+		cells := strings.Split(rawLine, ",")
+		getCell := func(i int) string {
+			if i < len(cells) {
+				return strings.TrimSpace(cells[i])
+			}
+			return ""
+		}
+		title := getCell(0)
+		projectID := getCell(1)
+		dueDate := getCell(2)
+		dueTime := getCell(3)
+		prioStr := getCell(4)
+		source := getCell(5)
+		ownerEmail := getCell(6)
+		hrsStr := getCell(7)
+		desc := ""
+		if len(cells) > 8 {
+			desc = strings.TrimSpace(strings.Join(cells[8:], ","))
+		}
+
+		if title == "" {
+			rows = append(rows, ImportTaskRow{Line: lineNum, Error: "Judul kosong"})
+			continue
+		}
+		if !projectExists[projectID] {
+			rows = append(rows, ImportTaskRow{Line: lineNum, Error: fmt.Sprintf("Proyek %q tidak ada", projectID)})
+			continue
+		}
+		if _, pErr := time.Parse("2006-01-02", dueDate); pErr != nil || len(dueDate) != 10 {
+			rows = append(rows, ImportTaskRow{Line: lineNum, Error: fmt.Sprintf("Tenggat %q bukan tanggal YYYY-MM-DD", dueDate)})
+			continue
+		}
+		if dueDate < today {
+			rows = append(rows, ImportTaskRow{Line: lineNum, Error: "Tenggat sudah lewat"})
+			continue
+		}
+		if dueTime != "" && !dueTimeRe.MatchString(dueTime) {
+			rows = append(rows, ImportTaskRow{Line: lineNum, Error: fmt.Sprintf("Jam tenggat %q bukan HH:MM", dueTime)})
+			continue
+		}
+		if prioStr == "" {
+			prioStr = string(task.PriorityNormal)
+		}
+		prio := task.Priority(prioStr)
+		if !prio.IsValid() {
+			rows = append(rows, ImportTaskRow{Line: lineNum, Error: fmt.Sprintf("Prioritas %q bukan rendah/normal/tinggi", prioStr)})
+			continue
+		}
+		dupKey := projectID + "|" + strings.ToLower(title)
+		if seen[dupKey] {
+			rows = append(rows, ImportTaskRow{Line: lineNum, Error: "Duplikat: judul yang sama sudah ada di proyek ini"})
+			continue
+		}
+
+		dt := dueTime
+		if dt == "" {
+			dt = "17:00"
+		}
+		built := task.Task{
+			OrganizationID: claims.OrganizationID,
+			ProjectID:      projectID,
+			PeriodID:       period.ID,
+			Title:          title,
+			Description:    desc,
+			DueDate:        dueDate,
+			DueTime:        dt,
+			Priority:       prio,
+			CompetencyIDs:  []string{},
+			CreatedAt:      nowStr,
+			CreatedBy:      claims.UserID,
+			UpdatedAt:      now,
+		}
+
+		if source != "" {
+			m, ok := memberByEmail[strings.ToLower(ownerEmail)]
+			if !ok {
+				rows = append(rows, ImportTaskRow{Line: lineNum, Error: fmt.Sprintf("Penanggung jawab %q tidak terdaftar", ownerEmail)})
+				continue
+			}
+			hrsVal, hErr := strconv.ParseFloat(strings.ReplaceAll(hrsStr, ",", "."), 64)
+			if hErr != nil || hrsVal <= 0 {
+				rows = append(rows, ImportTaskRow{Line: lineNum, Error: "Pekerjaan eksternal perlu jam lebih dari 0"})
+				continue
+			}
+			built.Status = task.StatusRunning
+			built.Assignments = []task.Assignment{{MemberID: m.ID, Hours: hrsVal}}
+			built.RemainingHours = hrsVal
+			built.ExternalSource = source
+		} else {
+			if len([]rune(desc)) < 20 {
+				rows = append(rows, ImportTaskRow{Line: lineNum, Error: "Deskripsi minimal 20 karakter supaya kebutuhan bisa diurai"})
+				continue
+			}
+			built.Status = task.StatusOpen
+			built.Assignments = []task.Assignment{}
+			built.RemainingHours = 0
+			if !dryRun && uc.ai != nil {
+				if dna, aErr := uc.ai.Analyze(ctx, title, desc, prio, catalog, existingTasks); aErr == nil {
+					built.DNA = &dna
+					built.RemainingHours = dna.EffortHours
+				}
+			}
+		}
+
+		seen[dupKey] = true
+		built.ID = fmt.Sprintf("TGS-%04d", previewSeq)
+		previewSeq++
+		cp := built
+		rows = append(rows, ImportTaskRow{Line: lineNum, Task: &cp})
+		validTasks = append(validTasks, built)
+		validIndices = append(validIndices, len(rows)-1)
+	}
+
+	if dryRun || len(validTasks) == 0 {
+		return rows, nil
+	}
+
+	err = uc.tx.WithinTx(ctx, func(txCtx context.Context) error {
+		for i, t := range validTasks {
+			code, codeErr := uc.tasks.NextTaskCode(txCtx, claims.OrganizationID)
+			if codeErr != nil {
+				return codeErr
+			}
+			t.ID = code
+			if err := uc.tasks.Create(txCtx, t); err != nil {
+				return err
+			}
+			cp := t
+			rows[validIndices[i]].Task = &cp
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
 }
 
 func (uc *TaskUseCase) BatchPreview(ctx context.Context, orgID string, preset workspace.PresetID) ([]engine.BatchPair, error) {

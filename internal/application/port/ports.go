@@ -165,3 +165,21 @@ type NotificationRepository interface {
 	MarkRead(ctx context.Context, orgID, userID, id string, at time.Time) error
 	MarkAllRead(ctx context.Context, orgID, userID string, at time.Time) error
 }
+
+// HRRepository persists HR settings, divisions, HR inbox requests, performance config, and reviews.
+type HRRepository interface {
+	GetHRSettings(ctx context.Context, orgID string) (workspace.HRSettings, error)
+	SaveHRSettings(ctx context.Context, orgID string, s workspace.HRSettings) error
+	GetPerformanceConfig(ctx context.Context, orgID string) (workspace.PerformanceConfig, error)
+	SavePerformanceConfig(ctx context.Context, orgID string, cfg workspace.PerformanceConfig) error
+	ListDivisions(ctx context.Context, orgID string) ([]string, error)
+	CreateDivision(ctx context.Context, orgID, name string) error
+	RenameDivision(ctx context.Context, orgID, oldName, newName string) error
+	PlaceMembers(ctx context.Context, orgID string, memberIDs []string, division string, team *string) error
+	ListHRRequests(ctx context.Context, orgID, statusFilter string) ([]workspace.HRRequest, error)
+	GetHRRequest(ctx context.Context, orgID, id string) (workspace.HRRequest, error)
+	CreateHRRequest(ctx context.Context, req workspace.HRRequest) error
+	UpdateHRRequest(ctx context.Context, req workspace.HRRequest) error
+	ListPerformanceReviews(ctx context.Context, orgID, period, memberID string) ([]workspace.PerformanceReview, error)
+	CreatePerformanceReview(ctx context.Context, rev workspace.PerformanceReview) error
+}

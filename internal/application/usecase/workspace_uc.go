@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/google/uuid"
@@ -19,17 +20,22 @@ import (
 
 // BootstrapState matches all workspace domain collections required by the Next.js WorkspaceProvider.
 type BootstrapState struct {
-	Organization workspace.Organization   `json:"organization"`
-	Period       workspace.WorkPeriod     `json:"period"`
-	Periods      []workspace.WorkPeriod   `json:"periods"`
-	Settings     workspace.EngineSettings `json:"settings"`
-	Competencies []member.Competency      `json:"competencies"`
-	Members      []member.Member          `json:"members"`
-	Projects     []project.Project        `json:"projects"`
-	Tasks        []task.Task              `json:"tasks"`
-	Decisions    []decision.Decision      `json:"decisions"`
-	Today        string                   `json:"today"`
-	Now          string                   `json:"now"`
+	Organization       workspace.Organization        `json:"organization"`
+	Period             workspace.WorkPeriod          `json:"period"`
+	Periods            []workspace.WorkPeriod        `json:"periods"`
+	Settings           workspace.EngineSettings      `json:"settings"`
+	HRSettings         *workspace.HRSettings         `json:"hrSettings,omitempty"`
+	Competencies       []member.Competency           `json:"competencies"`
+	Members            []member.Member               `json:"members"`
+	Divisions          []string                      `json:"divisions,omitempty"`
+	Projects           []project.Project             `json:"projects"`
+	Tasks              []task.Task                   `json:"tasks"`
+	Decisions          []decision.Decision           `json:"decisions"`
+	HRRequests         []workspace.HRRequest         `json:"hrRequests,omitempty"`
+	PerformanceConfig  *workspace.PerformanceConfig  `json:"performanceConfig,omitempty"`
+	PerformanceReviews []workspace.PerformanceReview `json:"performanceReviews,omitempty"`
+	Today              string                        `json:"today"`
+	Now                string                        `json:"now"`
 }
 
 // BillingSummary summarizes workspace seat usage and plan metadata (P32).
@@ -51,6 +57,7 @@ type WorkspaceUseCase struct {
 	tasks   port.TaskRepository
 	decs    port.DecisionRepository
 	auth    port.AuthRepository
+	hr      port.HRRepository
 	tokens  port.TokenService
 	mailer  port.Mailer
 	clock   port.Clock
@@ -66,6 +73,7 @@ func NewWorkspaceUseCase(
 	tasks port.TaskRepository,
 	decs port.DecisionRepository,
 	authRepo port.AuthRepository,
+	hr port.HRRepository,
 	tokens port.TokenService,
 	mailer port.Mailer,
 	clock port.Clock,
@@ -80,6 +88,7 @@ func NewWorkspaceUseCase(
 		tasks:    tasks,
 		decs:     decs,
 		auth:     authRepo,
+		hr:       hr,
 		tokens:   tokens,
 		mailer:   mailer,
 		clock:    clock,
@@ -135,7 +144,48 @@ func (uc *WorkspaceUseCase) Bootstrap(ctx context.Context, claims auth.Claims, p
 		return BootstrapState{}, err
 	}
 
-	// Anggota only sees their own tasks in full detail while still receiving capacity overview safely.
+	var divisions []string
+	var hrSettings *workspace.HRSettings
+	var hrRequests []workspace.HRRequest
+	var perfCfg *workspace.PerformanceConfig
+	var perfReviews []workspace.PerformanceReview
+
+	if uc.hr != nil {
+		divs, err := uc.hr.ListDivisions(ctx, claims.OrganizationID)
+		if err != nil {
+			return BootstrapState{}, err
+		}
+		divisions = divs
+
+		hs, err := uc.hr.GetHRSettings(ctx, claims.OrganizationID)
+		if err != nil {
+			return BootstrapState{}, err
+		}
+		hrSettings = &hs
+
+		if claims.Role.CanManage() || claims.Role.IsHR() {
+			pc, err := uc.hr.GetPerformanceConfig(ctx, claims.OrganizationID)
+			if err != nil {
+				return BootstrapState{}, err
+			}
+			perfCfg = &pc
+
+			revs, err := uc.hr.ListPerformanceReviews(ctx, claims.OrganizationID, "", "")
+			if err != nil {
+				return BootstrapState{}, err
+			}
+			perfReviews = revs
+		}
+		if claims.Role.CanAccessHR() {
+			reqs, err := uc.hr.ListHRRequests(ctx, claims.OrganizationID, "")
+			if err != nil {
+				return BootstrapState{}, err
+			}
+			hrRequests = reqs
+		}
+	}
+
+	// Anggota only sees their own email while still receiving capacity overview safely.
 	if claims.Role == auth.RoleMember {
 		for i := range members {
 			if members[i].ID != claims.MemberID {
@@ -146,17 +196,22 @@ func (uc *WorkspaceUseCase) Bootstrap(ctx context.Context, claims auth.Claims, p
 
 	nowStr := uc.clock.Now().UTC().Format("2006-01-02T15:04:05Z07:00")
 	return BootstrapState{
-		Organization: org,
-		Period:       active,
-		Periods:      periods,
-		Settings:     settings,
-		Competencies: comps,
-		Members:      members,
-		Projects:     projects,
-		Tasks:        tasks,
-		Decisions:    decisions,
-		Now:          nowStr,
-		Today:        nowStr[:10],
+		Organization:       org,
+		Period:             active,
+		Periods:            periods,
+		Settings:           settings,
+		HRSettings:         hrSettings,
+		Competencies:       comps,
+		Members:            members,
+		Divisions:          divisions,
+		Projects:           projects,
+		Tasks:              tasks,
+		Decisions:          decisions,
+		HRRequests:         hrRequests,
+		PerformanceConfig:  perfCfg,
+		PerformanceReviews: perfReviews,
+		Now:                nowStr,
+		Today:              nowStr[:10],
 	}, nil
 }
 
@@ -378,6 +433,9 @@ func (uc *WorkspaceUseCase) UpdateSettings(ctx context.Context, orgID string, s 
 	}
 	if s.OverloadAt < 0.6 || s.OverloadAt > 1.0 {
 		return workspace.EngineSettings{}, errs.Validation("Ambang beban tinggi harus antara 60% dan 100%.")
+	}
+	if math.IsNaN(s.ReserveRatio) || math.IsInf(s.ReserveRatio, 0) || s.ReserveRatio < 0 || s.ReserveRatio > 0.3 {
+		return workspace.EngineSettings{}, errs.Validation("Cadangan kapasitas harus antara 0% dan 30%.")
 	}
 	if err := uc.ws.SaveEngineSettings(ctx, orgID, s); err != nil {
 		return workspace.EngineSettings{}, err

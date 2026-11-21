@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/Orang2-BU/pantara-back/internal/application/usecase"
+	"github.com/Orang2-BU/pantara-back/internal/domain/errs"
 	"github.com/Orang2-BU/pantara-back/internal/domain/member"
 	"github.com/go-chi/chi/v5"
 )
@@ -42,22 +43,7 @@ func (h *selfHandlers) updateProfile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *selfHandlers) updateAvailability(w http.ResponseWriter, r *http.Request) {
-	claims := mustClaims(r.Context())
-	var body struct {
-		AvailableHours float64  `json:"availableHours"`
-		WeeklyLimit    float64  `json:"weeklyLimit"`
-		LeaveDates     []string `json:"leaveDates"`
-	}
-	if err := decodeJSON(w, r, &body); err != nil {
-		writeError(w, r, err)
-		return
-	}
-	m, err := h.uc.UpdateAvailability(r.Context(), claims, body.AvailableHours, body.WeeklyLimit, body.LeaveDates)
-	if err != nil {
-		writeError(w, r, err)
-		return
-	}
-	writeOK(w, map[string]any{"member": m})
+	writeError(w, r, errs.Forbidden("Ketersediaan dan batas kerja mingguan kini diatur oleh HR."))
 }
 
 func (h *selfHandlers) respondTask(w http.ResponseWriter, r *http.Request) {
@@ -97,4 +83,61 @@ func (h *selfHandlers) updateProgress(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeOK(w, map[string]any{"task": t})
+}
+
+func (h *selfHandlers) requestExtraTime(w http.ResponseWriter, r *http.Request) {
+	claims := mustClaims(r.Context())
+	id := chi.URLParam(r, "id")
+	var body struct {
+		Hours  float64 `json:"hours"`
+		Reason string  `json:"reason"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		writeError(w, r, err)
+		return
+	}
+	t, err := h.uc.RequestExtraTime(r.Context(), claims, id, body.Hours, body.Reason)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeOK(w, map[string]any{"task": t})
+}
+
+func (h *selfHandlers) requestTaskChange(w http.ResponseWriter, r *http.Request) {
+	claims := mustClaims(r.Context())
+	id := chi.URLParam(r, "id")
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		writeError(w, r, err)
+		return
+	}
+	t, err := h.uc.RequestTaskChange(r.Context(), claims, id, body.Reason)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeOK(w, map[string]any{"task": t})
+}
+
+func (h *selfHandlers) createLeaveRequest(w http.ResponseWriter, r *http.Request) {
+	claims := mustClaims(r.Context())
+	var body struct {
+		Start  string           `json:"start"`
+		End    string           `json:"end"`
+		Type   member.LeaveType `json:"type"`
+		Reason string           `json:"reason"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		writeError(w, r, err)
+		return
+	}
+	m, err := h.uc.CreateLeaveRequest(r.Context(), claims, body.Start, body.End, body.Type, body.Reason)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeCreated(w, map[string]any{"member": m})
 }

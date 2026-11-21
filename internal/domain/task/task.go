@@ -94,28 +94,60 @@ type Assignment struct {
 	Hours    float64 `json:"hours"`
 }
 
+// ExtraTimeStatus tracks manager decision on an employee's extra-time request.
+type ExtraTimeStatus string
+
+const (
+	ExtraTimePending  ExtraTimeStatus = "menunggu"
+	ExtraTimeApproved ExtraTimeStatus = "disetujui"
+	ExtraTimeRejected ExtraTimeStatus = "ditolak"
+)
+
+// ExtraTimeRequest holds the latest request from an assignee to extend estimated hours.
+type ExtraTimeRequest struct {
+	MemberID    string          `json:"memberId"`
+	Hours       float64         `json:"hours"`
+	Reason      string          `json:"reason"`
+	RequestedAt string          `json:"requestedAt"`
+	Status      ExtraTimeStatus `json:"status"`
+}
+
+// ChangeRequest tracks a freelancer's change/adjustment request reviewed by a manager.
+type ChangeRequest struct {
+	MemberID string `json:"memberId"`
+	Reason   string `json:"reason"`
+	Status   string `json:"status"` // "pending" | "reviewed"
+}
+
 // Task represents an operational work item inside a project and period.
 type Task struct {
-	ID             string       `json:"id"`
-	OrganizationID string       `json:"organizationId,omitempty"`
-	ProjectID      string       `json:"projectId"`
-	PeriodID       string       `json:"periodId,omitempty"`
-	Title          string       `json:"title"`
-	Description    string       `json:"description"`
-	DueDate        string       `json:"dueDate"`
-	Priority       Priority     `json:"priority"`
-	Status         Status       `json:"status"`
-	Assignments    []Assignment `json:"assignments"`
-	RemainingHours float64      `json:"remainingHours"`
-	CreatedAt      string       `json:"createdAt"`
-	DNA            *TaskDNA     `json:"dna,omitempty"`
-	CompetencyIDs  []string     `json:"competencyIds"`
-	ResponseReason string       `json:"responseReason,omitempty"`
-	ActualHours    *float64     `json:"actualHours,omitempty"`
-	FlowStartedAt  *time.Time   `json:"flowStartedAt,omitempty"`
-	IsArchived     bool         `json:"isArchived,omitempty"`
-	CreatedBy      string       `json:"createdBy,omitempty"`
-	UpdatedAt      time.Time    `json:"updatedAt,omitempty"`
+	ID             string            `json:"id"`
+	OrganizationID string            `json:"organizationId,omitempty"`
+	ProjectID      string            `json:"projectId"`
+	PeriodID       string            `json:"periodId,omitempty"`
+	Title          string            `json:"title"`
+	Description    string            `json:"description"`
+	DueDate        string            `json:"dueDate"`
+	DueTime        string            `json:"dueTime,omitempty"`
+	Priority       Priority          `json:"priority"`
+	Status         Status            `json:"status"`
+	Assignments    []Assignment      `json:"assignments"`
+	RemainingHours float64           `json:"remainingHours"`
+	CreatedAt      string            `json:"createdAt"`
+	DNA            *TaskDNA          `json:"dna,omitempty"`
+	CompetencyIDs  []string          `json:"competencyIds"`
+	ResponseReason string            `json:"responseReason,omitempty"`
+	ChangeRequest  *ChangeRequest    `json:"changeRequest,omitempty"`
+	ActualHours    *float64          `json:"actualHours,omitempty"`
+	CompletedAt    string            `json:"completedAt,omitempty"`
+	QualityScore   *float64          `json:"qualityScore,omitempty"`
+	ExternalSource string            `json:"externalSource,omitempty"`
+	ExtraTime      *ExtraTimeRequest `json:"extraTime,omitempty"`
+	ResultNote     string            `json:"resultNote,omitempty"`
+	FlowStartedAt  *time.Time        `json:"flowStartedAt,omitempty"`
+	IsArchived     bool              `json:"isArchived,omitempty"`
+	CreatedBy      string            `json:"createdBy,omitempty"`
+	UpdatedAt      time.Time         `json:"updatedAt,omitempty"`
 }
 
 // EffortOrRemaining returns DNA effort hours when set, otherwise remaining hours.

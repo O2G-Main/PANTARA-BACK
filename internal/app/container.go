@@ -29,6 +29,7 @@ type Container struct {
 	TaskUC        *usecase.TaskUseCase
 	SelfUC        *usecase.SelfUseCase
 	ReportNotifUC *usecase.ReportAndNotifUseCase
+	HRUC          *usecase.HRUseCase
 	Handler       http.Handler
 	Clock         port.Clock
 	Hasher        port.PasswordHasher
@@ -66,13 +67,15 @@ func NewContainer(cfg config.Config, store *sqlstore.Store, clock port.Clock, lo
 	tasks := sqlstore.TaskRepo{Store: store}
 	decs := sqlstore.DecisionRepo{Store: store}
 	notifs := sqlstore.NotificationRepo{Store: store}
+	hr := sqlstore.HRRepo{Store: store}
 
 	authUC := usecase.NewAuthUseCase(store, store, store, secStore, hasher, tokens, mlr, clock, cfg.AppBaseURL)
-	wsUC := usecase.NewWorkspaceUseCase(store, store, comps, members, projects, tasks, decs, store, tokens, mlr, clock, cfg.AppBaseURL)
-	catUC := usecase.NewCatalogUseCase(store, store, comps, members, projects, tasks, store, notifs, tokens, mlr, secStore, clock, cfg.AppBaseURL)
+	wsUC := usecase.NewWorkspaceUseCase(store, store, comps, members, projects, tasks, decs, store, hr, tokens, mlr, clock, cfg.AppBaseURL)
+	catUC := usecase.NewCatalogUseCase(store, store, comps, members, projects, tasks, store, notifs, hr, tokens, mlr, secStore, clock, cfg.AppBaseURL)
 	taskUC := usecase.NewTaskUseCase(store, store, comps, members, projects, tasks, decs, store, notifs, analyzer, clock)
-	selfUC := usecase.NewSelfUseCase(store, store, members, tasks, store, notifs, clock)
-	repUC := usecase.NewReportAndNotifUseCase(store, comps, members, projects, tasks, decs, notifs, clock)
+	selfUC := usecase.NewSelfUseCase(store, store, members, tasks, store, notifs, hr, clock)
+	repUC := usecase.NewReportAndNotifUseCase(store, comps, members, projects, tasks, decs, notifs, hr, clock)
+	hrUC := usecase.NewHRUseCase(store, store, members, tasks, store, notifs, hr, clock)
 
 	handler := httpadapter.NewRouter(httpadapter.RouterDeps{
 		AuthUC:             authUC,
@@ -81,6 +84,7 @@ func NewContainer(cfg config.Config, store *sqlstore.Store, clock port.Clock, lo
 		TaskUC:             taskUC,
 		SelfUC:             selfUC,
 		ReportNotifUC:      repUC,
+		HRUC:               hrUC,
 		Security:           secStore,
 		HealthCheck:        store.Ping,
 		CORSAllowedOrigins: cfg.CORSAllowedOrigins,
@@ -100,6 +104,7 @@ func NewContainer(cfg config.Config, store *sqlstore.Store, clock port.Clock, lo
 		TaskUC:        taskUC,
 		SelfUC:        selfUC,
 		ReportNotifUC: repUC,
+		HRUC:          hrUC,
 		Handler:       handler,
 		Clock:         clock,
 		Hasher:        hasher,
@@ -115,6 +120,7 @@ func (c *Container) SeedIfEmpty(ctx context.Context, fixedDates bool) (bool, err
 		Tasks:    sqlstore.TaskRepo{Store: c.Store},
 		Decs:     sqlstore.DecisionRepo{Store: c.Store},
 		Notifs:   sqlstore.NotificationRepo{Store: c.Store},
+		HR:       sqlstore.HRRepo{Store: c.Store},
 		Hasher:   c.Hasher,
 		Clock:    c.Clock,
 	}, seeddata.SeedOptions{FixedDates: fixedDates})
